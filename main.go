@@ -14,6 +14,7 @@ import (
 	"github.com/coreos/etcd/etcdserver/etcdhttp"
 	"github.com/coreos/etcd/proxy"
 	"github.com/coreos/etcd/raft"
+	"github.com/coreos/etcd/raft/raftpb"
 	"github.com/coreos/etcd/snap"
 	"github.com/coreos/etcd/store"
 	"github.com/coreos/etcd/wal"
@@ -78,14 +79,23 @@ func startEtcd() http.Handler {
 	if err := os.MkdirAll(*dir, privateDirMode); err != nil {
 		log.Fatalf("main: cannot create data directory: %v", err)
 	}
+	// TODO: create wal dir in this function.
+	wdir := path.Join(*dir, "wal")
+	if err := os.MkdirAll(wdir, privateDirMode); err != nil {
+		log.Fatalf("etcd: cannot create snapshot directory: %v", err)
+	}
 
-	n, w := startRaft(id, peers.IDs(), path.Join(*dir, "wal"))
+	n, w, snapshotter, snap := startRaft(id, peers.IDs(), path.Join(*dir, "wal"), wdir)
 
+	st := store.New()
+	if snap == nil {
+		st.Recovery(snap.Data)
+	}
 	tk := time.NewTicker(100 * time.Millisecond)
 	s := &etcdserver.Server{
-		Store:   store.New(),
+		Store:   st,
 		Node:    n,
-		Storage: storage{WAL: w},
+		Storage: storage{WAL: w, Snapshotter: snapshotter},
 		Send:    etcdhttp.Sender(*peers),
 		Ticker:  tk.C,
 	}
@@ -104,19 +114,29 @@ func startEtcd() http.Handler {
 // If the wal dir does not exist, startRaft will start a new raft node.
 // If the wal dir exists, startRaft will restart the previous raft node.
 // startRaft returns the started raft node and the opened wal.
-func startRaft(id int64, peerIDs []int64, waldir string) (raft.Node, *wal.WAL) {
+func startRaft(id int64, peerIDs []int64, waldir string, snapdir string) (raft.Node, *wal.WAL, *snap.Snapshotter, *raftpb.Snapshot) {
+	snapshoter := snap.New(snapdir)
 	if !wal.Exist(waldir) {
 		w, err := wal.Create(waldir)
 		if err != nil {
 			log.Fatal(err)
 		}
 		n := raft.Start(id, peerIDs, 10, 1)
-		return n, w
+		return n, w, snapshoter, nil
+	}
+
+	snapshot, err := snapshoter.Load()
+	if err != nil && err != snap.ErrNoSnapshot {
+		log.Fatal(err)
+	}
+
+	var index int64
+	if snapshot != nil {
+		index = snapshot.Index
 	}
 
 	// restart a node from previous wal
-	// TODO(xiangli): check snapshot; not open from one
-	w, err := wal.OpenAtIndex(waldir, 0)
+	w, err := wal.OpenAtIndex(waldir, index)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -128,8 +148,8 @@ func startRaft(id int64, peerIDs []int64, waldir string) (raft.Node, *wal.WAL) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	n := raft.Restart(id, peerIDs, 10, 1, st, ents)
-	return n, w
+	n := raft.Restart(id, snapshot, peerIDs, 10, 1, st, ents)
+	return n, w, snapshoter, snapshot
 }
 
 func startProxy() http.Handler {

@@ -74,9 +74,12 @@ func Start(id int64, peers []int64, election, heartbeat int) Node {
 // Restart is identical to Start but takes an initial State and a slice of
 // entries. Generally this is used when restarting from a stable storage
 // log.
-func Restart(id int64, peers []int64, election, heartbeat int, st pb.State, ents []pb.Entry) Node {
+func Restart(id int64, snap *pb.Snapshot, peers []int64, election, heartbeat int, st pb.State, ents []pb.Entry) Node {
 	n := newNode()
 	r := newRaft(id, peers, election, heartbeat)
+	if snap != nil {
+		r.restore(*snap)
+	}
 	r.loadState(st)
 	r.loadEnts(ents)
 	go n.run(r)
@@ -117,13 +120,6 @@ func (n *Node) run(r *raft) {
 			}
 		}
 
-		rd := newReady(r, prevSt, prevSnapi)
-		if rd.containsUpdates() {
-			readyc = n.readyc
-		} else {
-			readyc = nil
-		}
-
 		select {
 		case m := <-propc:
 			m.From = r.id
@@ -132,18 +128,27 @@ func (n *Node) run(r *raft) {
 			r.Step(m) // raft never returns an error
 		case <-n.tickc:
 			r.tick()
-		case readyc <- rd:
-			r.raftLog.resetNextEnts()
-			r.raftLog.resetUnstable()
-			if !IsEmptyState(rd.State) {
-				prevSt = rd.State
-			}
-			if !IsEmptySnap(rd.Snapshot) {
-				prevSnapi = rd.Snapshot.Index
-			}
-			r.msgs = nil
 		case <-n.done:
 			return
+		}
+
+		rd := newReady(r, prevSt, prevSnapi, prevLead)
+		if rd.containsUpdates() {
+			select {
+			case readyc <- rd:
+				r.raftLog.resetNextEnts()
+				r.raftLog.resetUnstable()
+				if !IsEmptyState(rd.State) {
+					prevSt = rd.State
+				}
+				if !IsEmptySnap(rd.Snapshot) {
+					prevSnapi = rd.Snapshot.Index
+				}
+				r.msgs = nil
+				<-done
+			case <-n.done:
+				return
+			}
 		}
 	}
 }

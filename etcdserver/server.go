@@ -37,8 +37,7 @@ type Storage interface {
 	// SavenSnap function saves snapshot to the underlying stable storage.
 	SaveSnap(snap raftpb.Snapshot)
 	// Cut cuts out a new wal file for saving new state and entries.
-	// TODO: remove cut function. WAL should take care of this.
-	Cut(index int64) error
+	Cut() error
 }
 
 type Server struct {
@@ -69,7 +68,7 @@ func Start(s *Server) {
 
 func (s *Server) run() {
 	var snapi int64
-	var commiti int64
+	var appliedi int64
 	for {
 		select {
 		case <-s.Ticker:
@@ -78,6 +77,13 @@ func (s *Server) run() {
 			s.Storage.Save(rd.State, rd.Entries)
 			// TODO: non-blocking snapshot saving
 			s.Storage.SaveSnap(rd.Snapshot)
+			// recover from snapshot if needed
+			if appliedi < rd.Snapshot.Index {
+				if err := s.Store.Recovery(rd.Snapshot.Data); err != nil {
+					panic(err)
+				}
+				log.Printf("id=%x recovered index=%d\n", p.id, s.Index)
+			}
 			s.Send(rd.Messages)
 
 			// TODO(bmizerany): do this in the background, but take
@@ -89,11 +95,11 @@ func (s *Server) run() {
 					panic("TODO: this is bad, what do we do about it?")
 				}
 				s.w.Trigger(r.Id, s.apply(r))
-				commiti = e.Index
+				appliedi = e.Index
 			}
-			if commiti-snapi > defaultSnapCount {
+			if appliedi-snapi > defaultSnapCount {
 				s.Snapshot()
-				snapi = commiti
+				snapi = appliedi
 			}
 		case <-s.done:
 			return
@@ -109,8 +115,7 @@ func (s *Server) Snapshot() {
 		return
 	}
 	s.Node.Compact(d)
-	// TODO: WAL.Cut should not ask for an index.
-	s.Storage.Cut(0)
+	s.Storage.Cut()
 }
 
 // Stop stops the server, and shutsdown the running goroutine. Stop should be

@@ -183,7 +183,7 @@ func TestNodeRestart(t *testing.T) {
 		CommittedEntries: entries[1 : st.Commit+1],
 	}
 
-	n := Restart(1, []int64{1}, 0, 0, st, entries)
+	n := Restart(1, nil, []int64{1}, 0, 0, st, entries)
 	if g := <-n.Ready(); !reflect.DeepEqual(g, want) {
 		t.Errorf("g = %+v,\n             w   %+v", g, want)
 	}

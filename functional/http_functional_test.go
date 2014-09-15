@@ -76,5 +76,5 @@ func stringp(s string) *string { return &s }
 type NopStorage struct{}
 
 func (ns NopStorage) Save(st raftpb.State, ents []raftpb.Entry) {}
-func (ns NopStorage) Cut(index int64) error                     { return nil }
+func (ns NopStorage) Cut() error                                { return nil }
 func (ns NopStorage) SaveSnap(st raftpb.Snapshot)               {}
