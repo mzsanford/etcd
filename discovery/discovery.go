@@ -46,6 +46,8 @@ func New(durl string, id int64, config string) (*discovery, error) {
 	if err != nil {
 		return nil, err
 	}
+	// discovery service redirects /[key] to /v2/keys/[key]
+	// set the prefix of client to "" to handle this
 	client.SetPrefix("")
 	return &discovery{
 		cluster: token,
