@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coreos/etcd/discovery"
 	"github.com/coreos/etcd/etcdserver"
 	"github.com/coreos/etcd/etcdserver/etcdhttp"
 	"github.com/coreos/etcd/pkg"
@@ -34,6 +35,7 @@ var (
 	timeout      = flag.Duration("timeout", 10*time.Second, "Request Timeout")
 	paddr        = flag.String("peer-bind-addr", ":7001", "Peer service address (e.g., ':7001')")
 	dir          = flag.String("data-dir", "", "Path to the data directory")
+	durl         = flag.String("discovery", "", "Discovery service used to bootstrap the cluster")
 	snapCount    = flag.Int64("snapshot-count", etcdserver.DefaultSnapCount, "Number of committed transactions to trigger a snapshot")
 	printVersion = flag.Bool("version", false, "Print the version and exit")
 
@@ -142,6 +144,16 @@ func startEtcd() {
 	st := store.New()
 
 	if !wal.Exist(waldir) {
+		if *durl != "" {
+			d, err := discovery.New(*durl, self.ID, cluster.String())
+			if err != nil {
+				log.Fatalf("etcd: cannot init discovery %v", err)
+			}
+			cluster, err = d.Discover()
+			if err != nil {
+				log.Fatalf("etcd: %v", err)
+			}
+		}
 		w, err = wal.Create(waldir)
 		if err != nil {
 			log.Fatal(err)

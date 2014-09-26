@@ -14,7 +14,7 @@ import (
 	"github.com/coreos/etcd/third_party/code.google.com/p/go.net/context"
 )
 
-const (
+var (
 	v2Prefix = "/v2/keys"
 )
 
@@ -45,6 +45,10 @@ func NewHTTPClient(tr *http.Transport, ep string, timeout time.Duration) (*httpC
 	}
 
 	return c, nil
+}
+
+func (c *httpClient) SetPrefix(p string) {
+	v2Prefix = p
 }
 
 func (c *httpClient) Create(key, val string, ttl time.Duration) (*Response, error) {

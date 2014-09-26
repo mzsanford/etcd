@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/coreos/etcd/client"
-	"github.com/coreos/etcd/etcdserver/etcdhttp"
+	"github.com/coreos/etcd/etcdserver"
 )
 
 func TestCheckCluster(t *testing.T) {
@@ -222,14 +222,14 @@ func TestNodesToPeers(t *testing.T) {
 		{Key: "/1000/2", Value: "2=2.2.2.2", CreatedIndex: 2},
 		{Key: "/1000/3", Value: "3=3.3.3.3", CreatedIndex: 3},
 	}
-	w := &etcdhttp.Peers{}
+	w := &etcdserver.Cluster{}
 	w.Set("1=1.1.1.1&2=2.2.2.2&3=3.3.3.3")
 
 	badnodes := client.Nodes{{Key: "1000/1", Value: "1=1.1.1.1&???", CreatedIndex: 1}}
 
 	tests := []struct {
 		ns client.Nodes
-		wp *etcdhttp.Peers
+		wc *etcdserver.Cluster
 		we bool
 	}{
 		{nodes, w, false},
@@ -237,7 +237,7 @@ func TestNodesToPeers(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		peers, err := nodesToPeers(tt.ns)
+		cluster, err := nodesToCluster(tt.ns)
 		if tt.we {
 			if err == nil {
 				t.Fatalf("#%d: err = %v, want not nil", i, err)
@@ -247,8 +247,8 @@ func TestNodesToPeers(t *testing.T) {
 				t.Fatalf("#%d: err = %v, want nil", i, err)
 			}
 		}
-		if !reflect.DeepEqual(peers, tt.wp) {
-			t.Errorf("#%d: peers = %v, want %v", i, peers, tt.wp)
+		if !reflect.DeepEqual(cluster, tt.wc) {
+			t.Errorf("#%d: cluster = %v, want %v", i, cluster, tt.wc)
 		}
 	}
 }
