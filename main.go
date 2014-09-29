@@ -36,6 +36,7 @@ var (
 	paddr        = flag.String("peer-bind-addr", ":7001", "Peer service address (e.g., ':7001')")
 	dir          = flag.String("data-dir", "", "Path to the data directory")
 	durl         = flag.String("discovery", "", "Discovery service used to bootstrap the cluster")
+	purls        = flag.String("advertised-peer-urls", "", "Comma-separated public urls used for peer communication")
 	snapCount    = flag.Int64("snapshot-count", etcdserver.DefaultSnapCount, "Number of committed transactions to trigger a snapshot")
 	printVersion = flag.Bool("version", false, "Print the version and exit")
 
@@ -145,7 +146,11 @@ func startEtcd() {
 
 	if !wal.Exist(waldir) {
 		if *durl != "" {
-			d, err := discovery.New(*durl, self.ID, cluster.String())
+			if *purls == "" {
+				log.Fatal("etcd: discovery requires advertised-peer-urls")
+			}
+			cfg := fmt.Sprintf("%s=%s", *name, *purls)
+			d, err := discovery.New(*durl, self.ID, cfg)
 			if err != nil {
 				log.Fatalf("etcd: cannot init discovery %v", err)
 			}
