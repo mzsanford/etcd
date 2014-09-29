@@ -36,7 +36,7 @@ var (
 	paddr        = flag.String("peer-bind-addr", ":7001", "Peer service address (e.g., ':7001')")
 	dir          = flag.String("data-dir", "", "Path to the data directory")
 	durl         = flag.String("discovery", "", "Discovery service used to bootstrap the cluster")
-	purls        = flag.String("advertised-peer-urls", "", "Comma-separated public urls used for peer communication")
+	purls        = flag.String("advertise-peer-urls", "", "Comma-separated public urls used for peer communication")
 	snapCount    = flag.Int64("snapshot-count", etcdserver.DefaultSnapCount, "Number of committed transactions to trigger a snapshot")
 	printVersion = flag.Bool("version", false, "Print the version and exit")
 

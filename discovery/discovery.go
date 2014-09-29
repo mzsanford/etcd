@@ -24,7 +24,7 @@ var (
 	ErrFullCluster   = errors.New("discovery: cluster is full")
 )
 
-type Discovery interface {
+type Discoverer interface {
 	Discover() (*etcdserver.Cluster, error)
 }
 
@@ -35,7 +35,7 @@ type discovery struct {
 	c       client.Client
 }
 
-func New(durl string, id int64, config string) (*discovery, error) {
+func New(durl string, id int64, config string) (Discoverer, error) {
 	u, err := url.Parse(durl)
 	if err != nil {
 		return nil, err
