@@ -170,11 +170,11 @@ func (w *WAL) ReadAll() (id int64, state raftpb.HardState, ents []raftpb.Entry, 
 			state = mustUnmarshalState(rec.Data)
 		case infoType:
 			i := mustUnmarshalInfo(rec.Data)
-			if id != 0 && id != i.ID {
+			if id != 0 && id != i.Id {
 				state.Reset()
 				return 0, state, nil, ErrIDMismatch
 			}
-			id = i.ID
+			id = i.Id
 		case crcType:
 			crc := decoder.crc.Sum32()
 			// current crc of decoder must match the crc of the record.
