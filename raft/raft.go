@@ -69,10 +69,18 @@ func (pr *progress) update(n int64) {
 	pr.next = n + 1
 }
 
-func (pr *progress) decr() {
+func (pr *progress) maybeDecrTo(to int64) bool {
+	// the rejection must be stale if the
+	// progress has matched with follower
+	// or "to" does not match next - 1
+	if pr.match != 0 || pr.next-1 != to {
+		return false
+	}
+
 	if pr.next--; pr.next < 1 {
 		pr.next = 1
 	}
+	return true
 }
 
 func (pr *progress) String() string {
@@ -373,7 +381,7 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 	if r.raftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...) {
 		r.send(pb.Message{To: m.From, Type: msgAppResp, Index: r.raftLog.lastIndex()})
 	} else {
-		r.send(pb.Message{To: m.From, Type: msgAppResp, Denied: true})
+		r.send(pb.Message{To: m.From, Type: msgAppResp, Index: m.Index, Denied: true})
 	}
 }
 
@@ -416,8 +424,9 @@ func stepLeader(r *raft, m pb.Message) {
 		r.bcastAppend()
 	case msgAppResp:
 		if m.Denied {
-			r.prs[m.From].decr()
-			r.sendAppend(m.From)
+			if r.prs[m.From].maybeDecrTo(m.Index) {
+				r.sendAppend(m.From)
+			}
 		} else {
 			r.prs[m.From].update(m.Index)
 			if r.maybeCommit() {
