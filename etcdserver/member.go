@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"path"
 	"strconv"
 	"time"
@@ -13,18 +14,31 @@ import (
 
 const machineKVPrefix = "/_etcd/machines/"
 
-type Member struct {
-	ID   int64
-	Name string
+// RaftAttributes represents the raft related attributes of an etcd member.
+type RaftAttributes struct {
 	// TODO(philips): ensure these are URLs
-	PeerURLs   []string
+	PeerURLs []string
+}
+
+// Attributes represents all the non-raft related attributes of an etcd member.
+type Attributes struct {
+	Name       string
 	ClientURLs []string
+}
+
+type Member struct {
+	ID uint64
+	RaftAttributes
+	Attributes
 }
 
 // newMember creates a Member without an ID and generates one based on the
 // name, peer URLs. This is used for bootstrapping.
 func newMember(name string, peerURLs types.URLs, now *time.Time) *Member {
-	m := &Member{Name: name, PeerURLs: peerURLs.StringSlice()}
+	m := &Member{
+		RaftAttributes: RaftAttributes{PeerURLs: peerURLs.StringSlice()},
+		Attributes:     Attributes{Name: name},
+	}
 
 	b := []byte(m.Name)
 	for _, p := range m.PeerURLs {
@@ -36,14 +50,18 @@ func newMember(name string, peerURLs types.URLs, now *time.Time) *Member {
 	}
 
 	hash := sha1.Sum(b)
-	m.ID = int64(binary.BigEndian.Uint64(hash[:8]))
-	if m.ID < 0 {
-		m.ID = m.ID * -1
-	}
-
+	m.ID = binary.BigEndian.Uint64(hash[:8])
 	return m
 }
 
 func (m Member) storeKey() string {
-	return path.Join(machineKVPrefix, strconv.FormatUint(uint64(m.ID), 16))
+	return path.Join(machineKVPrefix, strconv.FormatUint(m.ID, 16))
+}
+
+func parseMemberID(key string) uint64 {
+	id, err := strconv.ParseUint(path.Base(key), 16, 64)
+	if err != nil {
+		log.Panicf("unexpected parse member id error: %v", err)
+	}
+	return id
 }

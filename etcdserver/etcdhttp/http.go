@@ -35,15 +35,12 @@ const (
 var errClosed = errors.New("etcdhttp: client closed connection")
 
 // NewClientHandler generates a muxed http.Handler with the given parameters to serve etcd client requests.
-func NewClientHandler(server *etcdserver.EtcdServer, clusterStore etcdserver.ClusterStore, timeout time.Duration) http.Handler {
+func NewClientHandler(server *etcdserver.EtcdServer) http.Handler {
 	sh := &serverHandler{
 		server:       server,
-		clusterStore: clusterStore,
+		clusterStore: server.ClusterStore,
 		timer:        server,
-		timeout:      timeout,
-	}
-	if sh.timeout == 0 {
-		sh.timeout = defaultServerTimeout
+		timeout:      defaultServerTimeout,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(keysPrefix, sh.serveKeys)
@@ -148,7 +145,7 @@ func (h serverHandler) serveRaft(w http.ResponseWriter, r *http.Request) {
 // parseRequest converts a received http.Request to a server Request,
 // performing validation of supplied fields as appropriate.
 // If any validation fails, an empty Request and non-nil error is returned.
-func parseRequest(r *http.Request, id int64) (etcdserverpb.Request, error) {
+func parseRequest(r *http.Request, id uint64) (etcdserverpb.Request, error) {
 	emptyReq := etcdserverpb.Request{}
 
 	err := r.ParseForm()
@@ -352,6 +349,7 @@ func handleWatch(ctx context.Context, w http.ResponseWriter, wa store.Watcher, s
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Etcd-Index", fmt.Sprint(wa.StartIndex()))
 	w.Header().Set("X-Raft-Index", fmt.Sprint(rt.Index()))
 	w.Header().Set("X-Raft-Term", fmt.Sprint(rt.Term()))
 	w.WriteHeader(http.StatusOK)

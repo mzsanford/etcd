@@ -14,8 +14,9 @@ import (
 	"github.com/coreos/etcd/third_party/code.google.com/p/go.net/context"
 )
 
-const (
-	v2Prefix = "/v2/keys"
+var (
+	v2Prefix   = "/v2/keys"
+	ErrTimeout = context.DeadlineExceeded
 )
 
 // transport mimics http.Transport to provide an interface which can be
@@ -47,12 +48,18 @@ func NewHTTPClient(tr *http.Transport, ep string, timeout time.Duration) (*httpC
 	return c, nil
 }
 
+func (c *httpClient) SetPrefix(p string) {
+	v2Prefix = p
+}
+
 func (c *httpClient) Create(key, val string, ttl time.Duration) (*Response, error) {
-	uintTTL := uint64(ttl.Seconds())
 	create := &createAction{
 		Key:   key,
 		Value: val,
-		TTL:   &uintTTL,
+	}
+	if ttl >= 0 {
+		uttl := uint64(ttl.Seconds())
+		create.TTL = &uttl
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)

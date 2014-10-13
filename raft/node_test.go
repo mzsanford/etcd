@@ -18,10 +18,10 @@ func TestNodeStep(t *testing.T) {
 			propc: make(chan raftpb.Message, 1),
 			recvc: make(chan raftpb.Message, 1),
 		}
-		msgt := int64(i)
+		msgt := uint64(i)
 		n.Step(context.TODO(), raftpb.Message{Type: msgt})
 		// Proposal goes to proc chan. Others go to recvc chan.
-		if int64(i) == msgProp {
+		if uint64(i) == msgProp {
 			select {
 			case <-n.propc:
 			default:
@@ -31,7 +31,7 @@ func TestNodeStep(t *testing.T) {
 			if msgt == msgBeat || msgt == msgHup {
 				select {
 				case <-n.recvc:
-					t.Errorf("%d: step should ignore msgHub/msgBeat", i, mtmap[i])
+					t.Errorf("%d: step should ignore %s", i, mtmap[i])
 				default:
 				}
 			} else {
@@ -74,7 +74,7 @@ func TestNodeStepUnblock(t *testing.T) {
 		select {
 		case err := <-errc:
 			if err != tt.werr {
-				t.Errorf("#%d: err = %v, want %v", err, tt.werr)
+				t.Errorf("#%d: err = %v, want %v", i, err, tt.werr)
 			}
 			//clean up side-effect
 			if ctx.Err() != nil {
@@ -96,7 +96,7 @@ func TestNodeStepUnblock(t *testing.T) {
 // who is the current leader.
 func TestBlockProposal(t *testing.T) {
 	n := newNode()
-	r := newRaft(1, []int64{1}, 10, 1)
+	r := newRaft(1, []uint64{1}, 10, 1)
 	go n.run(r)
 	defer n.Stop()
 
@@ -149,21 +149,34 @@ func TestNode(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	cc := raftpb.ConfChange{Type: raftpb.ConfChangeAddNode, NodeID: 1}
+	ccdata, err := cc.Marshal()
+	if err != nil {
+		t.Fatalf("unexpected marshal error: %v", err)
+	}
 	wants := []Ready{
 		{
-			SoftState:        &SoftState{Lead: 1, RaftState: StateLeader},
-			HardState:        raftpb.HardState{Term: 1, Commit: 1},
-			Entries:          []raftpb.Entry{{}, {Term: 1, Index: 1}},
-			CommittedEntries: []raftpb.Entry{{Term: 1, Index: 1}},
+			SoftState: &SoftState{Lead: 1, Nodes: []uint64{1}, RaftState: StateLeader},
+			HardState: raftpb.HardState{Term: 1, Commit: 2},
+			Entries: []raftpb.Entry{
+				{},
+				{Type: raftpb.EntryConfChange, Term: 1, Index: 1, Data: ccdata},
+				{Term: 1, Index: 2},
+			},
+			CommittedEntries: []raftpb.Entry{
+				{Type: raftpb.EntryConfChange, Term: 1, Index: 1, Data: ccdata},
+				{Term: 1, Index: 2},
+			},
 		},
 		{
-			HardState:        raftpb.HardState{Term: 1, Commit: 2},
-			Entries:          []raftpb.Entry{{Term: 1, Index: 2, Data: []byte("foo")}},
-			CommittedEntries: []raftpb.Entry{{Term: 1, Index: 2, Data: []byte("foo")}},
+			HardState:        raftpb.HardState{Term: 1, Commit: 3},
+			Entries:          []raftpb.Entry{{Term: 1, Index: 3, Data: []byte("foo")}},
+			CommittedEntries: []raftpb.Entry{{Term: 1, Index: 3, Data: []byte("foo")}},
 		},
 	}
 
-	n := StartNode(1, []int64{1}, 0, 0)
+	n := StartNode(1, []Peer{{ID: 1}}, 10, 1)
+	n.ApplyConfChange(cc)
 	n.Campaign(ctx)
 	if g := <-n.Ready(); !reflect.DeepEqual(g, wants[0]) {
 		t.Errorf("#%d: g = %+v,\n             w   %+v", 1, g, wants[0])
@@ -195,7 +208,7 @@ func TestNodeRestart(t *testing.T) {
 		CommittedEntries: entries[1 : st.Commit+1],
 	}
 
-	n := RestartNode(1, []int64{1}, 0, 0, nil, st, entries)
+	n := RestartNode(1, 10, 1, nil, st, entries)
 	if g := <-n.Ready(); !reflect.DeepEqual(g, want) {
 		t.Errorf("g = %+v,\n             w   %+v", g, want)
 	}
@@ -209,20 +222,21 @@ func TestNodeRestart(t *testing.T) {
 
 // TestCompacts ensures Node.Compact creates a correct raft snapshot and compacts
 // the raft log (call raft.compact)
-func TestCompact(t *testing.T) {
+func TestNodeCompact(t *testing.T) {
 	ctx := context.Background()
 	n := newNode()
-	r := newRaft(1, []int64{1}, 0, 0)
+	r := newRaft(1, []uint64{1}, 10, 1)
 	go n.run(r)
 
 	n.Campaign(ctx)
 	n.Propose(ctx, []byte("foo"))
 
 	w := raftpb.Snapshot{
-		Term:  1,
-		Index: 2, // one nop + one proposal
-		Data:  []byte("a snapshot"),
-		Nodes: []int64{1},
+		Term:         1,
+		Index:        2, // one nop + one proposal
+		Data:         []byte("a snapshot"),
+		Nodes:        []uint64{1},
+		RemovedNodes: []uint64{},
 	}
 
 	pkg.ForceGosched()
@@ -232,7 +246,7 @@ func TestCompact(t *testing.T) {
 		t.Fatalf("unexpected proposal failure: unable to commit entry")
 	}
 
-	n.Compact(w.Data)
+	n.Compact(w.Index, w.Nodes, w.Data)
 	pkg.ForceGosched()
 	select {
 	case rd := <-n.Ready():
@@ -257,7 +271,25 @@ func TestCompact(t *testing.T) {
 	}
 }
 
-func TestIsStateEqual(t *testing.T) {
+func TestSoftStateEqual(t *testing.T) {
+	tests := []struct {
+		st *SoftState
+		we bool
+	}{
+		{&SoftState{}, true},
+		{&SoftState{Lead: 1}, false},
+		{&SoftState{RaftState: StateLeader}, false},
+		{&SoftState{ShouldStop: true}, false},
+		{&SoftState{Nodes: []uint64{1, 2}}, false},
+	}
+	for i, tt := range tests {
+		if g := tt.st.equal(&SoftState{}); g != tt.we {
+			t.Errorf("#%d, equal = %v, want %v", i, g, tt.we)
+		}
+	}
+}
+
+func TestIsHardStateEqual(t *testing.T) {
 	tests := []struct {
 		st raftpb.HardState
 		we bool

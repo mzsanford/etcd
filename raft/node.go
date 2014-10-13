@@ -3,6 +3,7 @@ package raft
 import (
 	"errors"
 	"log"
+	"reflect"
 
 	pb "github.com/coreos/etcd/raft/raftpb"
 	"github.com/coreos/etcd/third_party/code.google.com/p/go.net/context"
@@ -10,18 +11,22 @@ import (
 
 var (
 	emptyState = pb.HardState{}
+
+	// ErrStopped is returned by methods on Nodes that have been stopped.
 	ErrStopped = errors.New("raft: stopped")
 )
 
 // SoftState provides state that is useful for logging and debugging.
 // The state is volatile and does not need to be persisted to the WAL.
 type SoftState struct {
-	Lead      int64
-	RaftState StateType
+	Lead       uint64
+	RaftState  StateType
+	Nodes      []uint64
+	ShouldStop bool
 }
 
 func (a *SoftState) equal(b *SoftState) bool {
-	return a.Lead == b.Lead && a.RaftState == b.RaftState
+	return reflect.DeepEqual(a, b)
 }
 
 // Ready encapsulates the entries and messages that are ready to read,
@@ -55,14 +60,22 @@ type Ready struct {
 	Messages []pb.Message
 }
 
+type compact struct {
+	index uint64
+	nodes []uint64
+	data  []byte
+}
+
 func isHardStateEqual(a, b pb.HardState) bool {
 	return a.Term == b.Term && a.Vote == b.Vote && a.Commit == b.Commit
 }
 
+// IsEmptyHardState returns true if the given HardState is empty.
 func IsEmptyHardState(st pb.HardState) bool {
 	return isHardStateEqual(st, emptyState)
 }
 
+// IsEmptySnap returns true if the given Snapshot is empty.
 func IsEmptySnap(sp pb.Snapshot) bool {
 	return sp.Index == 0
 }
@@ -72,6 +85,7 @@ func (rd Ready) containsUpdates() bool {
 		len(rd.Entries) > 0 || len(rd.CommittedEntries) > 0 || len(rd.Messages) > 0
 }
 
+// Node represents a node in a raft cluster.
 type Node interface {
 	// Tick increments the internal logical clock for the Node by a single tick. Election
 	// timeouts and heartbeat timeouts are in units of ticks.
@@ -94,15 +108,39 @@ type Node interface {
 	ApplyConfChange(cc pb.ConfChange)
 	// Stop performs any necessary termination of the Node
 	Stop()
-	// Compact
-	Compact(d []byte)
+	// Compact discards the entrire log up to the given index. It also
+	// generates a raft snapshot containing the given nodes configuration
+	// and the given snapshot data.
+	// It is the caller's responsibility to ensure the given configuration
+	// and snapshot data match the actual point-in-time configuration and snapshot
+	// at the given index.
+	Compact(index uint64, nodes []uint64, d []byte)
+}
+
+type Peer struct {
+	ID      uint64
+	Context []byte
 }
 
 // StartNode returns a new Node given a unique raft id, a list of raft peers, and
 // the election and heartbeat timeouts in units of ticks.
-func StartNode(id int64, peers []int64, election, heartbeat int) Node {
+// It also builds ConfChangeAddNode entry for each peer and puts them at the head of the log.
+func StartNode(id uint64, peers []Peer, election, heartbeat int) Node {
 	n := newNode()
-	r := newRaft(id, peers, election, heartbeat)
+	r := newRaft(id, nil, election, heartbeat)
+
+	ents := make([]pb.Entry, len(peers))
+	for i, peer := range peers {
+		cc := pb.ConfChange{Type: pb.ConfChangeAddNode, NodeID: peer.ID, Context: peer.Context}
+		data, err := cc.Marshal()
+		if err != nil {
+			panic("unexpected marshal error")
+		}
+		ents[i] = pb.Entry{Type: pb.EntryConfChange, Term: 1, Index: uint64(i + 1), Data: data}
+	}
+	r.raftLog.append(0, ents...)
+	r.raftLog.committed = uint64(len(ents))
+
 	go n.run(r)
 	return &n
 }
@@ -110,9 +148,9 @@ func StartNode(id int64, peers []int64, election, heartbeat int) Node {
 // RestartNode is identical to StartNode but takes an initial State and a slice
 // of entries. Generally this is used when restarting from a stable storage
 // log.
-func RestartNode(id int64, peers []int64, election, heartbeat int, snapshot *pb.Snapshot, st pb.HardState, ents []pb.Entry) Node {
+func RestartNode(id uint64, election, heartbeat int, snapshot *pb.Snapshot, st pb.HardState, ents []pb.Entry) Node {
 	n := newNode()
-	r := newRaft(id, peers, election, heartbeat)
+	r := newRaft(id, nil, election, heartbeat)
 	if snapshot != nil {
 		r.restore(*snapshot)
 	}
@@ -126,7 +164,7 @@ func RestartNode(id int64, peers []int64, election, heartbeat int, snapshot *pb.
 type node struct {
 	propc    chan pb.Message
 	recvc    chan pb.Message
-	compactc chan []byte
+	compactc chan compact
 	confc    chan pb.ConfChange
 	readyc   chan Ready
 	tickc    chan struct{}
@@ -137,7 +175,7 @@ func newNode() node {
 	return node{
 		propc:    make(chan pb.Message),
 		recvc:    make(chan pb.Message),
-		compactc: make(chan []byte),
+		compactc: make(chan compact),
 		confc:    make(chan pb.ConfChange),
 		readyc:   make(chan Ready),
 		tickc:    make(chan struct{}),
@@ -185,8 +223,8 @@ func (n *node) run(r *raft) {
 			r.Step(m)
 		case m := <-n.recvc:
 			r.Step(m) // raft never returns an error
-		case d := <-n.compactc:
-			r.compact(d)
+		case c := <-n.compactc:
+			r.compact(c.index, c.nodes, c.data)
 		case cc := <-n.confc:
 			switch cc.Type {
 			case pb.ConfChangeAddNode:
@@ -284,14 +322,14 @@ func (n *node) ApplyConfChange(cc pb.ConfChange) {
 	}
 }
 
-func (n *node) Compact(d []byte) {
+func (n *node) Compact(index uint64, nodes []uint64, d []byte) {
 	select {
-	case n.compactc <- d:
+	case n.compactc <- compact{index, nodes, d}:
 	case <-n.done:
 	}
 }
 
-func newReady(r *raft, prevSoftSt *SoftState, prevHardSt pb.HardState, prevSnapi int64) Ready {
+func newReady(r *raft, prevSoftSt *SoftState, prevHardSt pb.HardState, prevSnapi uint64) Ready {
 	rd := Ready{
 		Entries:          r.raftLog.unstableEnts(),
 		CommittedEntries: r.raftLog.nextEnts(),

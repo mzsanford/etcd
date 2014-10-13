@@ -3,6 +3,7 @@ package raft
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"math/rand"
 	"reflect"
 	"sort"
@@ -57,7 +58,7 @@ func TestLogReplication(t *testing.T) {
 	tests := []struct {
 		*network
 		msgs       []pb.Message
-		wcommitted int64
+		wcommitted uint64
 	}{
 		{
 			newNetwork(nil, nil, nil),
@@ -91,13 +92,13 @@ func TestLogReplication(t *testing.T) {
 				t.Errorf("#%d.%d: committed = %d, want %d", i, j, sm.raftLog.committed, tt.wcommitted)
 			}
 
-			ents := make([]pb.Entry, 0)
+			ents := []pb.Entry{}
 			for _, e := range nextEnts(sm) {
 				if e.Data != nil {
 					ents = append(ents, e)
 				}
 			}
-			props := make([]pb.Message, 0)
+			props := []pb.Message{}
 			for _, m := range tt.msgs {
 				if m.Type == msgProp {
 					props = append(props, m)
@@ -201,9 +202,9 @@ func TestCommitWithoutNewTermEntry(t *testing.T) {
 }
 
 func TestDuelingCandidates(t *testing.T) {
-	a := newRaft(-1, nil, 0, 0) // k, id are set later
-	b := newRaft(-1, nil, 0, 0)
-	c := newRaft(-1, nil, 0, 0)
+	a := newRaft(1, []uint64{1, 2, 3}, 10, 1)
+	b := newRaft(2, []uint64{1, 2, 3}, 10, 1)
+	c := newRaft(3, []uint64{1, 2, 3}, 10, 1)
 
 	nt := newNetwork(a, b, c)
 	nt.cut(1, 3)
@@ -218,7 +219,7 @@ func TestDuelingCandidates(t *testing.T) {
 	tests := []struct {
 		sm      *raft
 		state   StateType
-		term    int64
+		term    uint64
 		raftLog *raftLog
 	}{
 		{a, StateFollower, 2, wlog},
@@ -234,7 +235,7 @@ func TestDuelingCandidates(t *testing.T) {
 			t.Errorf("#%d: term = %d, want %d", i, g, tt.term)
 		}
 		base := ltoa(tt.raftLog)
-		if sm, ok := nt.peers[1+int64(i)].(*raft); ok {
+		if sm, ok := nt.peers[1+uint64(i)].(*raft); ok {
 			l := ltoa(sm.raftLog)
 			if g := diffu(base, l); g != "" {
 				t.Errorf("#%d: diff:\n%s", i, g)
@@ -408,43 +409,128 @@ func TestProposalByProxy(t *testing.T) {
 	}
 }
 
-func TestCommit(t *testing.T) {
+func TestCompact(t *testing.T) {
 	tests := []struct {
-		matches []int64
-		logs    []pb.Entry
-		smTerm  int64
-		w       int64
+		compacti uint64
+		nodes    []uint64
+		removed  []uint64
+		snapd    []byte
+		wpanic   bool
 	}{
-		// single
-		{[]int64{1}, []pb.Entry{{}, {Term: 1}}, 1, 1},
-		{[]int64{1}, []pb.Entry{{}, {Term: 1}}, 2, 0},
-		{[]int64{2}, []pb.Entry{{}, {Term: 1}, {Term: 2}}, 2, 2},
-		{[]int64{1}, []pb.Entry{{}, {Term: 2}}, 2, 1},
-
-		// odd
-		{[]int64{2, 1, 1}, []pb.Entry{{}, {Term: 1}, {Term: 2}}, 1, 1},
-		{[]int64{2, 1, 1}, []pb.Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
-		{[]int64{2, 1, 2}, []pb.Entry{{}, {Term: 1}, {Term: 2}}, 2, 2},
-		{[]int64{2, 1, 2}, []pb.Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
-
-		// even
-		{[]int64{2, 1, 1, 1}, []pb.Entry{{}, {Term: 1}, {Term: 2}}, 1, 1},
-		{[]int64{2, 1, 1, 1}, []pb.Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
-		{[]int64{2, 1, 1, 2}, []pb.Entry{{}, {Term: 1}, {Term: 2}}, 1, 1},
-		{[]int64{2, 1, 1, 2}, []pb.Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
-		{[]int64{2, 1, 2, 2}, []pb.Entry{{}, {Term: 1}, {Term: 2}}, 2, 2},
-		{[]int64{2, 1, 2, 2}, []pb.Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
+		{1, []uint64{1, 2, 3}, []uint64{4, 5}, []byte("some data"), false},
+		{2, []uint64{1, 2, 3}, []uint64{4, 5}, []byte("some data"), false},
+		{4, []uint64{1, 2, 3}, []uint64{4, 5}, []byte("some data"), true}, // compact out of range
 	}
 
 	for i, tt := range tests {
-		prs := make(map[int64]*progress)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if tt.wpanic != true {
+						t.Errorf("%d: panic = %v, want %v", i, true, tt.wpanic)
+					}
+				}
+			}()
+			sm := &raft{
+				state: StateLeader,
+				raftLog: &raftLog{
+					committed: 2,
+					applied:   2,
+					ents:      []pb.Entry{{}, {Term: 1}, {Term: 1}, {Term: 1}},
+				},
+				removed: make(map[uint64]bool),
+			}
+			for _, r := range tt.removed {
+				sm.removeNode(r)
+			}
+			sm.compact(tt.compacti, tt.nodes, tt.snapd)
+			sort.Sort(uint64Slice(sm.raftLog.snapshot.Nodes))
+			sort.Sort(uint64Slice(sm.raftLog.snapshot.RemovedNodes))
+			if sm.raftLog.offset != tt.compacti {
+				t.Errorf("%d: log.offset = %d, want %d", i, sm.raftLog.offset, tt.compacti)
+			}
+			if !reflect.DeepEqual(sm.raftLog.snapshot.Nodes, tt.nodes) {
+				t.Errorf("%d: snap.nodes = %v, want %v", i, sm.raftLog.snapshot.Nodes, tt.nodes)
+			}
+			if !reflect.DeepEqual(sm.raftLog.snapshot.Data, tt.snapd) {
+				t.Errorf("%d: snap.data = %v, want %v", i, sm.raftLog.snapshot.Data, tt.snapd)
+			}
+			if !reflect.DeepEqual(sm.raftLog.snapshot.RemovedNodes, tt.removed) {
+				t.Errorf("%d: snap.removedNodes = %v, want %v", i, sm.raftLog.snapshot.RemovedNodes, tt.removed)
+			}
+		}()
+	}
+}
+
+func TestCommit(t *testing.T) {
+	tests := []struct {
+		matches []uint64
+		logs    []pb.Entry
+		smTerm  uint64
+		w       uint64
+	}{
+		// single
+		{[]uint64{1}, []pb.Entry{{}, {Term: 1}}, 1, 1},
+		{[]uint64{1}, []pb.Entry{{}, {Term: 1}}, 2, 0},
+		{[]uint64{2}, []pb.Entry{{}, {Term: 1}, {Term: 2}}, 2, 2},
+		{[]uint64{1}, []pb.Entry{{}, {Term: 2}}, 2, 1},
+
+		// odd
+		{[]uint64{2, 1, 1}, []pb.Entry{{}, {Term: 1}, {Term: 2}}, 1, 1},
+		{[]uint64{2, 1, 1}, []pb.Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
+		{[]uint64{2, 1, 2}, []pb.Entry{{}, {Term: 1}, {Term: 2}}, 2, 2},
+		{[]uint64{2, 1, 2}, []pb.Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
+
+		// even
+		{[]uint64{2, 1, 1, 1}, []pb.Entry{{}, {Term: 1}, {Term: 2}}, 1, 1},
+		{[]uint64{2, 1, 1, 1}, []pb.Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
+		{[]uint64{2, 1, 1, 2}, []pb.Entry{{}, {Term: 1}, {Term: 2}}, 1, 1},
+		{[]uint64{2, 1, 1, 2}, []pb.Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
+		{[]uint64{2, 1, 2, 2}, []pb.Entry{{}, {Term: 1}, {Term: 2}}, 2, 2},
+		{[]uint64{2, 1, 2, 2}, []pb.Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
+	}
+
+	for i, tt := range tests {
+		prs := make(map[uint64]*progress)
 		for j := 0; j < len(tt.matches); j++ {
-			prs[int64(j)] = &progress{tt.matches[j], tt.matches[j] + 1}
+			prs[uint64(j)] = &progress{tt.matches[j], tt.matches[j] + 1}
 		}
 		sm := &raft{raftLog: &raftLog{ents: tt.logs}, prs: prs, HardState: pb.HardState{Term: tt.smTerm}}
 		sm.maybeCommit()
 		if g := sm.raftLog.committed; g != tt.w {
 			t.Errorf("#%d: committed = %d, want %d", i, g, tt.w)
+		}
+	}
+}
+
+func TestIsElectionTimeout(t *testing.T) {
+	tests := []struct {
+		elapse       int
+		wprobability float64
+		round        bool
+	}{
+		{5, 0, false},
+		{13, 0.3, true},
+		{15, 0.5, true},
+		{18, 0.8, true},
+		{20, 1, false},
+	}
+
+	for i, tt := range tests {
+		sm := newRaft(1, []uint64{1}, 10, 1)
+		sm.elapsed = tt.elapse
+		c := 0
+		for j := 0; j < 10000; j++ {
+			if sm.isElectionTimeout() {
+				c++
+			}
+		}
+		got := float64(c) / 10000.0
+		if tt.round {
+			got = math.Floor(got*10+0.5) / 10.0
+		}
+		if got != tt.wprobability {
+			t.Errorf("#%d: possibility = %v, want %v", i, got, tt.wprobability)
 		}
 	}
 }
@@ -456,7 +542,7 @@ func TestStepIgnoreOldTermMsg(t *testing.T) {
 	fakeStep := func(r *raft, m pb.Message) {
 		called = true
 	}
-	sm := newRaft(1, []int64{1}, 0, 0)
+	sm := newRaft(1, []uint64{1}, 10, 1)
 	sm.step = fakeStep
 	sm.Term = 2
 	sm.Step(pb.Message{Type: msgApp, Term: sm.Term - 1})
@@ -473,9 +559,9 @@ func TestStepIgnoreOldTermMsg(t *testing.T) {
 func TestHandleMsgApp(t *testing.T) {
 	tests := []struct {
 		m       pb.Message
-		wIndex  int64
-		wCommit int64
-		wDenied bool
+		wIndex  uint64
+		wCommit uint64
+		wReject bool
 	}{
 		// Ensure 1
 		{pb.Message{Type: msgApp, Term: 2, LogTerm: 3, Index: 2, Commit: 3}, 2, 0, true}, // previous log mismatch
@@ -489,8 +575,10 @@ func TestHandleMsgApp(t *testing.T) {
 		{pb.Message{Type: msgApp, Term: 2, LogTerm: 1, Index: 1, Commit: 4, Entries: []pb.Entry{{Term: 2}}}, 2, 2, false},
 
 		// Ensure 3
-		{pb.Message{Type: msgApp, Term: 2, LogTerm: 2, Index: 2, Commit: 2}, 2, 2, false},
-		{pb.Message{Type: msgApp, Term: 2, LogTerm: 2, Index: 2, Commit: 4}, 2, 2, false}, // commit upto min(commit, last)
+		{pb.Message{Type: msgApp, Term: 1, LogTerm: 1, Index: 1, Commit: 3}, 2, 1, false},                                 // match entry 1, commit upto last new entry 1
+		{pb.Message{Type: msgApp, Term: 1, LogTerm: 1, Index: 1, Commit: 3, Entries: []pb.Entry{{Term: 2}}}, 2, 2, false}, // match entry 1, commit upto last new entry 2
+		{pb.Message{Type: msgApp, Term: 2, LogTerm: 2, Index: 2, Commit: 3}, 2, 2, false},                                 // match entry 2, commit upto last new entry 2
+		{pb.Message{Type: msgApp, Term: 2, LogTerm: 2, Index: 2, Commit: 4}, 2, 2, false},                                 // commit upto log.last()
 	}
 
 	for i, tt := range tests {
@@ -511,8 +599,8 @@ func TestHandleMsgApp(t *testing.T) {
 		if len(m) != 1 {
 			t.Fatalf("#%d: msg = nil, want 1", i)
 		}
-		if m[0].Denied != tt.wDenied {
-			t.Errorf("#%d: denied = %v, want %v", i, m[0].Denied, tt.wDenied)
+		if m[0].Reject != tt.wReject {
+			t.Errorf("#%d: reject = %v, want %v", i, m[0].Reject, tt.wReject)
 		}
 	}
 }
@@ -520,9 +608,9 @@ func TestHandleMsgApp(t *testing.T) {
 func TestRecvMsgVote(t *testing.T) {
 	tests := []struct {
 		state   StateType
-		i, term int64
-		voteFor int64
-		wdenied bool
+		i, term uint64
+		voteFor uint64
+		wreject bool
 	}{
 		{StateFollower, 0, 0, None, true},
 		{StateFollower, 0, 1, None, true},
@@ -552,7 +640,7 @@ func TestRecvMsgVote(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		sm := newRaft(1, []int64{1}, 0, 0)
+		sm := newRaft(1, []uint64{1}, 10, 1)
 		sm.state = tt.state
 		switch tt.state {
 		case StateFollower:
@@ -572,8 +660,8 @@ func TestRecvMsgVote(t *testing.T) {
 			t.Fatalf("#%d: len(msgs) = %d, want 1", i, g)
 			continue
 		}
-		if g := msgs[0].Denied; g != tt.wdenied {
-			t.Errorf("#%d, m.Denied = %d, want %d", i, g, tt.wdenied)
+		if g := msgs[0].Reject; g != tt.wreject {
+			t.Errorf("#%d, m.Reject = %v, want %v", i, g, tt.wreject)
 		}
 	}
 }
@@ -583,12 +671,12 @@ func TestStateTransition(t *testing.T) {
 		from   StateType
 		to     StateType
 		wallow bool
-		wterm  int64
-		wlead  int64
+		wterm  uint64
+		wlead  uint64
 	}{
 		{StateFollower, StateFollower, true, 1, None},
 		{StateFollower, StateCandidate, true, 1, None},
-		{StateFollower, StateLeader, false, -1, None},
+		{StateFollower, StateLeader, false, 0, None},
 
 		{StateCandidate, StateFollower, true, 0, None},
 		{StateCandidate, StateCandidate, true, 1, None},
@@ -609,7 +697,7 @@ func TestStateTransition(t *testing.T) {
 				}
 			}()
 
-			sm := newRaft(1, []int64{1}, 0, 0)
+			sm := newRaft(1, []uint64{1}, 10, 1)
 			sm.state = tt.from
 
 			switch tt.to {
@@ -636,19 +724,19 @@ func TestAllServerStepdown(t *testing.T) {
 		state StateType
 
 		wstate StateType
-		wterm  int64
-		windex int64
+		wterm  uint64
+		windex uint64
 	}{
 		{StateFollower, StateFollower, 3, 1},
 		{StateCandidate, StateFollower, 3, 1},
 		{StateLeader, StateFollower, 3, 2},
 	}
 
-	tmsgTypes := [...]int64{msgVote, msgApp}
-	tterm := int64(3)
+	tmsgTypes := [...]uint64{msgVote, msgApp}
+	tterm := uint64(3)
 
 	for i, tt := range tests {
-		sm := newRaft(1, []int64{1, 2, 3}, 0, 0)
+		sm := newRaft(1, []uint64{1, 2, 3}, 10, 1)
 		switch tt.state {
 		case StateFollower:
 			sm.becomeFollower(1, None)
@@ -668,10 +756,10 @@ func TestAllServerStepdown(t *testing.T) {
 			if sm.Term != tt.wterm {
 				t.Errorf("#%d.%d term = %v , want %v", i, j, sm.Term, tt.wterm)
 			}
-			if int64(len(sm.raftLog.ents)) != tt.windex {
+			if uint64(len(sm.raftLog.ents)) != tt.windex {
 				t.Errorf("#%d.%d index = %v , want %v", i, j, len(sm.raftLog.ents), tt.windex)
 			}
-			wlead := int64(2)
+			wlead := uint64(2)
 			if msgType == msgVote {
 				wlead = None
 			}
@@ -684,25 +772,26 @@ func TestAllServerStepdown(t *testing.T) {
 
 func TestLeaderAppResp(t *testing.T) {
 	tests := []struct {
-		index      int64
-		denied     bool
+		index      uint64
+		reject     bool
 		wmsgNum    int
-		windex     int64
-		wcommitted int64
+		windex     uint64
+		wcommitted uint64
 	}{
-		{-1, true, 1, 1, 0}, // bad resp; leader does not commit; reply with log entries
-		{2, false, 2, 2, 2}, // good resp; leader commits; broadcast with commit index
+		{3, true, 0, 0, 0},  // stale resp; no replies
+		{2, true, 1, 1, 0},  // denied resp; leader does not commit; decrese next and send probing msg
+		{2, false, 2, 2, 2}, // accept resp; leader commits; broadcast with commit index
 	}
 
 	for i, tt := range tests {
 		// sm term is 1 after it becomes the leader.
 		// thus the last log term must be 1 to be committed.
-		sm := newRaft(1, []int64{1, 2, 3}, 0, 0)
+		sm := newRaft(1, []uint64{1, 2, 3}, 10, 1)
 		sm.raftLog = &raftLog{ents: []pb.Entry{{}, {Term: 0}, {Term: 1}}}
 		sm.becomeCandidate()
 		sm.becomeLeader()
 		sm.ReadMessages()
-		sm.Step(pb.Message{From: 2, Type: msgAppResp, Index: tt.index, Term: sm.Term, Denied: tt.denied})
+		sm.Step(pb.Message{From: 2, Type: msgAppResp, Index: tt.index, Term: sm.Term, Reject: tt.reject})
 		msgs := sm.ReadMessages()
 
 		if len(msgs) != tt.wmsgNum {
@@ -722,14 +811,14 @@ func TestLeaderAppResp(t *testing.T) {
 // When the leader receives a heartbeat tick, it should
 // send a msgApp with m.Index = 0, m.LogTerm=0 and empty entries.
 func TestBcastBeat(t *testing.T) {
-	offset := int64(1000)
+	offset := uint64(1000)
 	// make a state machine with log.offset = 1000
 	s := pb.Snapshot{
 		Index: offset,
 		Term:  1,
-		Nodes: []int64{1, 2, 3},
+		Nodes: []uint64{1, 2, 3},
 	}
-	sm := newRaft(1, []int64{1, 2, 3}, 0, 0)
+	sm := newRaft(1, []uint64{1, 2, 3}, 10, 1)
 	sm.Term = 1
 	sm.restore(s)
 
@@ -744,7 +833,7 @@ func TestBcastBeat(t *testing.T) {
 	if len(msgs) != 2 {
 		t.Fatalf("len(msgs) = %v, want 1", len(msgs))
 	}
-	tomap := map[int64]bool{2: true, 3: true}
+	tomap := map[uint64]bool{2: true, 3: true}
 	for i, m := range msgs {
 		if m.Type != msgApp {
 			t.Fatalf("#%d: type = %v, want = %v", i, m.Type, msgApp)
@@ -779,7 +868,7 @@ func TestRecvMsgBeat(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		sm := newRaft(1, []int64{1, 2, 3}, 0, 0)
+		sm := newRaft(1, []uint64{1, 2, 3}, 10, 1)
 		sm.raftLog = &raftLog{ents: []pb.Entry{{}, {Term: 0}, {Term: 1}}}
 		sm.Term = 1
 		sm.state = tt.state
@@ -807,12 +896,13 @@ func TestRecvMsgBeat(t *testing.T) {
 
 func TestRestore(t *testing.T) {
 	s := pb.Snapshot{
-		Index: defaultCompactThreshold + 1,
-		Term:  defaultCompactThreshold + 1,
-		Nodes: []int64{1, 2, 3},
+		Index:        defaultCompactThreshold + 1,
+		Term:         defaultCompactThreshold + 1,
+		Nodes:        []uint64{1, 2, 3},
+		RemovedNodes: []uint64{4, 5},
 	}
 
-	sm := newRaft(1, []int64{1, 2}, 0, 0)
+	sm := newRaft(1, []uint64{1, 2}, 10, 1)
 	if ok := sm.restore(s); !ok {
 		t.Fatal("restore fail, want succeed")
 	}
@@ -823,12 +913,15 @@ func TestRestore(t *testing.T) {
 	if sm.raftLog.term(s.Index) != s.Term {
 		t.Errorf("log.lastTerm = %d, want %d", sm.raftLog.term(s.Index), s.Term)
 	}
-	sg := int64Slice(sm.nodes())
-	sw := int64Slice(s.Nodes)
-	sort.Sort(sg)
-	sort.Sort(sw)
-	if !reflect.DeepEqual(sg, sw) {
-		t.Errorf("sm.Nodes = %+v, want %+v", sg, sw)
+	sg := sm.nodes()
+	srn := sm.removedNodes()
+	sort.Sort(uint64Slice(sg))
+	sort.Sort(uint64Slice(srn))
+	if !reflect.DeepEqual(sg, s.Nodes) {
+		t.Errorf("sm.Nodes = %+v, want %+v", sg, s.Nodes)
+	}
+	if !reflect.DeepEqual(s.RemovedNodes, srn) {
+		t.Errorf("sm.RemovedNodes = %+v, want %+v", s.RemovedNodes, srn)
 	}
 	if !reflect.DeepEqual(sm.raftLog.snapshot, s) {
 		t.Errorf("snapshot = %+v, want %+v", sm.raftLog.snapshot, s)
@@ -843,9 +936,9 @@ func TestProvideSnap(t *testing.T) {
 	s := pb.Snapshot{
 		Index: defaultCompactThreshold + 1,
 		Term:  defaultCompactThreshold + 1,
-		Nodes: []int64{1, 2},
+		Nodes: []uint64{1, 2},
 	}
-	sm := newRaft(1, []int64{1}, 0, 0)
+	sm := newRaft(1, []uint64{1}, 10, 1)
 	// restore the statemachin from a snapshot
 	// so it has a compacted log and a snapshot
 	sm.restore(s)
@@ -857,7 +950,7 @@ func TestProvideSnap(t *testing.T) {
 	// node 1 needs a snapshot
 	sm.prs[2].next = sm.raftLog.offset
 
-	sm.Step(pb.Message{From: 2, To: 1, Type: msgAppResp, Index: -1, Denied: true})
+	sm.Step(pb.Message{From: 2, To: 1, Type: msgAppResp, Index: sm.prs[2].next - 1, Reject: true})
 	msgs := sm.ReadMessages()
 	if len(msgs) != 1 {
 		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
@@ -872,11 +965,11 @@ func TestRestoreFromSnapMsg(t *testing.T) {
 	s := pb.Snapshot{
 		Index: defaultCompactThreshold + 1,
 		Term:  defaultCompactThreshold + 1,
-		Nodes: []int64{1, 2},
+		Nodes: []uint64{1, 2},
 	}
 	m := pb.Message{Type: msgSnap, From: 1, Term: 2, Snapshot: s}
 
-	sm := newRaft(2, []int64{1, 2}, 0, 0)
+	sm := newRaft(2, []uint64{1, 2}, 10, 1)
 	sm.Step(m)
 
 	if !reflect.DeepEqual(sm.raftLog.snapshot, s) {
@@ -894,7 +987,7 @@ func TestSlowNodeRestore(t *testing.T) {
 	}
 	lead := nt.peers[1].(*raft)
 	nextEnts(lead)
-	lead.compact(nil)
+	lead.compact(lead.raftLog.applied, lead.nodes(), nil)
 
 	nt.recover()
 	// trigger a snapshot
@@ -915,7 +1008,7 @@ func TestSlowNodeRestore(t *testing.T) {
 // it appends the entry to log and sets pendingConf to be true.
 func TestStepConfig(t *testing.T) {
 	// a raft that cannot make progress
-	r := newRaft(1, []int64{1, 2}, 0, 0)
+	r := newRaft(1, []uint64{1, 2}, 10, 1)
 	r.becomeCandidate()
 	r.becomeLeader()
 	index := r.raftLog.lastIndex()
@@ -933,7 +1026,7 @@ func TestStepConfig(t *testing.T) {
 // the proposal and keep its original state.
 func TestStepIgnoreConfig(t *testing.T) {
 	// a raft that cannot make progress
-	r := newRaft(1, []int64{1, 2}, 0, 0)
+	r := newRaft(1, []uint64{1, 2}, 10, 1)
 	r.becomeCandidate()
 	r.becomeLeader()
 	r.Step(pb.Message{From: 1, To: 1, Type: msgProp, Entries: []pb.Entry{{Type: pb.EntryConfChange}}})
@@ -959,7 +1052,7 @@ func TestRecoverPendingConfig(t *testing.T) {
 		{pb.EntryConfChange, true},
 	}
 	for i, tt := range tests {
-		r := newRaft(1, []int64{1, 2}, 0, 0)
+		r := newRaft(1, []uint64{1, 2}, 10, 1)
 		r.appendEntry(pb.Entry{Type: tt.entType})
 		r.becomeCandidate()
 		r.becomeLeader()
@@ -978,7 +1071,7 @@ func TestRecoverDoublePendingConfig(t *testing.T) {
 				t.Errorf("expect panic, but nothing happens")
 			}
 		}()
-		r := newRaft(1, []int64{1, 2}, 0, 0)
+		r := newRaft(1, []uint64{1, 2}, 10, 1)
 		r.appendEntry(pb.Entry{Type: pb.EntryConfChange})
 		r.appendEntry(pb.Entry{Type: pb.EntryConfChange})
 		r.becomeCandidate()
@@ -986,49 +1079,107 @@ func TestRecoverDoublePendingConfig(t *testing.T) {
 	}()
 }
 
-// TestAddNode tests that addNode could update pendingConf and peer list correctly.
+// TestAddNode tests that addNode could update pendingConf and nodes correctly.
 func TestAddNode(t *testing.T) {
-	r := newRaft(1, []int64{1}, 0, 0)
+	r := newRaft(1, []uint64{1}, 10, 1)
 	r.pendingConf = true
 	r.addNode(2)
 	if r.pendingConf != false {
 		t.Errorf("pendingConf = %v, want false", r.pendingConf)
 	}
 	nodes := r.nodes()
-	sort.Sort(int64Slice(nodes))
-	wnodes := []int64{1, 2}
+	sort.Sort(uint64Slice(nodes))
+	wnodes := []uint64{1, 2}
 	if !reflect.DeepEqual(nodes, wnodes) {
 		t.Errorf("nodes = %v, want %v", nodes, wnodes)
 	}
 }
 
-// TestRemoveNode tests that removeNode could update pendingConf and peer list correctly.
+// TestRemoveNode tests that removeNode could update pendingConf, nodes and
+// and removed list correctly.
 func TestRemoveNode(t *testing.T) {
-	r := newRaft(1, []int64{1, 2}, 0, 0)
+	r := newRaft(1, []uint64{1, 2}, 10, 1)
 	r.pendingConf = true
 	r.removeNode(2)
 	if r.pendingConf != false {
 		t.Errorf("pendingConf = %v, want false", r.pendingConf)
 	}
-	w := []int64{1}
+	w := []uint64{1}
 	if g := r.nodes(); !reflect.DeepEqual(g, w) {
 		t.Errorf("nodes = %v, want %v", g, w)
+	}
+	wremoved := map[uint64]bool{2: true}
+	if !reflect.DeepEqual(r.removed, wremoved) {
+		t.Errorf("rmNodes = %v, want %v", r.removed, wremoved)
+	}
+}
+
+// TestRecvMsgDenied tests that state machine sets the removed list when
+// handling msgDenied, and does not pass it to the actual stepX function.
+func TestRecvMsgDenied(t *testing.T) {
+	called := false
+	fakeStep := func(r *raft, m pb.Message) {
+		called = true
+	}
+	r := newRaft(1, []uint64{1, 2}, 10, 1)
+	r.step = fakeStep
+	r.Step(pb.Message{From: 2, Type: msgDenied})
+	if called != false {
+		t.Errorf("stepFunc called = %v , want %v", called, false)
+	}
+	wremoved := map[uint64]bool{1: true}
+	if !reflect.DeepEqual(r.removed, wremoved) {
+		t.Errorf("rmNodes = %v, want %v", r.removed, wremoved)
+	}
+}
+
+// TestRecvMsgFromRemovedNode tests that state machine sends correct
+// messages out when handling message from removed node, and does not
+// pass it to the actual stepX function.
+func TestRecvMsgFromRemovedNode(t *testing.T) {
+	tests := []struct {
+		from    uint64
+		wmsgNum int
+	}{
+		{1, 0},
+		{2, 1},
+	}
+	for i, tt := range tests {
+		called := false
+		fakeStep := func(r *raft, m pb.Message) {
+			called = true
+		}
+		r := newRaft(1, []uint64{1}, 10, 1)
+		r.step = fakeStep
+		r.removeNode(tt.from)
+		r.Step(pb.Message{From: tt.from, Type: msgVote})
+		if called != false {
+			t.Errorf("#%d: stepFunc called = %v , want %v", i, called, false)
+		}
+		if len(r.msgs) != tt.wmsgNum {
+			t.Errorf("#%d: len(msgs) = %d, want %d", i, len(r.msgs), tt.wmsgNum)
+		}
+		for j, msg := range r.msgs {
+			if msg.Type != msgDenied {
+				t.Errorf("#%d.%d: msgType = %d, want %d", i, j, msg.Type, msgDenied)
+			}
+		}
 	}
 }
 
 func TestPromotable(t *testing.T) {
-	id := int64(1)
+	id := uint64(1)
 	tests := []struct {
-		peers []int64
+		peers []uint64
 		wp    bool
 	}{
-		{[]int64{1}, true},
-		{[]int64{1, 2, 3}, true},
-		{[]int64{}, false},
-		{[]int64{2, 3}, false},
+		{[]uint64{1}, true},
+		{[]uint64{1, 2, 3}, true},
+		{[]uint64{}, false},
+		{[]uint64{2, 3}, false},
 	}
 	for i, tt := range tests {
-		r := &raft{id: id, prs: make(map[int64]*progress)}
+		r := &raft{id: id, prs: make(map[uint64]*progress)}
 		for _, id := range tt.peers {
 			r.prs[id] = &progress{}
 		}
@@ -1038,7 +1189,7 @@ func TestPromotable(t *testing.T) {
 	}
 }
 
-func ents(terms ...int64) *raft {
+func ents(terms ...uint64) *raft {
 	ents := []pb.Entry{{}}
 	for _, term := range terms {
 		ents = append(ents, pb.Entry{Term: term})
@@ -1050,9 +1201,9 @@ func ents(terms ...int64) *raft {
 }
 
 type network struct {
-	peers   map[int64]Interface
+	peers   map[uint64]Interface
 	dropm   map[connem]float64
-	ignorem map[int64]bool
+	ignorem map[uint64]bool
 }
 
 // newNetwork initializes a network from peers.
@@ -1061,22 +1212,22 @@ type network struct {
 // When using stateMachine, the address list is always [0, n).
 func newNetwork(peers ...Interface) *network {
 	size := len(peers)
-	peerAddrs := make([]int64, size)
+	peerAddrs := make([]uint64, size)
 	for i := 0; i < size; i++ {
-		peerAddrs[i] = 1 + int64(i)
+		peerAddrs[i] = 1 + uint64(i)
 	}
 
-	npeers := make(map[int64]Interface, size)
+	npeers := make(map[uint64]Interface, size)
 
 	for i, p := range peers {
 		id := peerAddrs[i]
 		switch v := p.(type) {
 		case nil:
-			sm := newRaft(id, peerAddrs, 0, 0)
+			sm := newRaft(id, peerAddrs, 10, 1)
 			npeers[id] = sm
 		case *raft:
 			v.id = id
-			v.prs = make(map[int64]*progress)
+			v.prs = make(map[uint64]*progress)
 			for i := 0; i < size; i++ {
 				v.prs[peerAddrs[i]] = &progress{}
 			}
@@ -1091,7 +1242,7 @@ func newNetwork(peers ...Interface) *network {
 	return &network{
 		peers:   npeers,
 		dropm:   make(map[connem]float64),
-		ignorem: make(map[int64]bool),
+		ignorem: make(map[uint64]bool),
 	}
 }
 
@@ -1104,18 +1255,18 @@ func (nw *network) send(msgs ...pb.Message) {
 	}
 }
 
-func (nw *network) drop(from, to int64, perc float64) {
+func (nw *network) drop(from, to uint64, perc float64) {
 	nw.dropm[connem{from, to}] = perc
 }
 
-func (nw *network) cut(one, other int64) {
+func (nw *network) cut(one, other uint64) {
 	nw.drop(one, other, 1)
 	nw.drop(other, one, 1)
 }
 
-func (nw *network) isolate(id int64) {
+func (nw *network) isolate(id uint64) {
 	for i := 0; i < len(nw.peers); i++ {
-		nid := int64(i) + 1
+		nid := uint64(i) + 1
 		if nid != id {
 			nw.drop(id, nid, 1.0)
 			nw.drop(nid, id, 1.0)
@@ -1123,17 +1274,17 @@ func (nw *network) isolate(id int64) {
 	}
 }
 
-func (nw *network) ignore(t int64) {
+func (nw *network) ignore(t uint64) {
 	nw.ignorem[t] = true
 }
 
 func (nw *network) recover() {
 	nw.dropm = make(map[connem]float64)
-	nw.ignorem = make(map[int64]bool)
+	nw.ignorem = make(map[uint64]bool)
 }
 
 func (nw *network) filter(msgs []pb.Message) []pb.Message {
-	mm := make([]pb.Message, 0)
+	mm := []pb.Message{}
 	for _, m := range msgs {
 		if nw.ignorem[m.Type] {
 			continue
@@ -1154,7 +1305,7 @@ func (nw *network) filter(msgs []pb.Message) []pb.Message {
 }
 
 type connem struct {
-	from, to int64
+	from, to uint64
 }
 
 type blackHole struct{}

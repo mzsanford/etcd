@@ -501,8 +501,8 @@ func TestWriteError(t *testing.T) {
 
 type dummyRaftTimer struct{}
 
-func (drt dummyRaftTimer) Index() int64 { return int64(100) }
-func (drt dummyRaftTimer) Term() int64  { return int64(5) }
+func (drt dummyRaftTimer) Index() uint64 { return uint64(100) }
+func (drt dummyRaftTimer) Term() uint64  { return uint64(5) }
 
 func TestWriteEvent(t *testing.T) {
 	// nil event should not panic
@@ -572,12 +572,14 @@ func TestWriteEvent(t *testing.T) {
 
 type dummyWatcher struct {
 	echan chan *store.Event
+	sidx  uint64
 }
 
 func (w *dummyWatcher) EventChan() chan *store.Event {
 	return w.echan
 }
-func (w *dummyWatcher) Remove() {}
+func (w *dummyWatcher) StartIndex() uint64 { return w.sidx }
+func (w *dummyWatcher) Remove()            {}
 
 func TestV2MachinesEndpoint(t *testing.T) {
 	tests := []struct {
@@ -589,7 +591,7 @@ func TestV2MachinesEndpoint(t *testing.T) {
 		{"POST", http.StatusMethodNotAllowed},
 	}
 
-	m := NewClientHandler(nil, &fakeCluster{}, time.Hour)
+	m := NewClientHandler(&etcdserver.EtcdServer{ClusterStore: &fakeCluster{}})
 	s := httptest.NewServer(m)
 	defer s.Close()
 
@@ -612,9 +614,9 @@ func TestV2MachinesEndpoint(t *testing.T) {
 func TestServeMachines(t *testing.T) {
 	cluster := &fakeCluster{
 		members: []etcdserver.Member{
-			{ID: 0xBEEF0, ClientURLs: []string{"http://localhost:8080"}},
-			{ID: 0xBEEF1, ClientURLs: []string{"http://localhost:8081"}},
-			{ID: 0xBEEF2, ClientURLs: []string{"http://localhost:8082"}},
+			{ID: 0xBEEF0, Attributes: etcdserver.Attributes{ClientURLs: []string{"http://localhost:8080"}}},
+			{ID: 0xBEEF1, Attributes: etcdserver.Attributes{ClientURLs: []string{"http://localhost:8081"}}},
+			{ID: 0xBEEF2, Attributes: etcdserver.Attributes{ClientURLs: []string{"http://localhost:8082"}}},
 		},
 	}
 
@@ -997,75 +999,6 @@ func TestServeKeysWatch(t *testing.T) {
 	}
 }
 
-func TestHandleWatch(t *testing.T) {
-	rw := httptest.NewRecorder()
-	wa := &dummyWatcher{
-		echan: make(chan *store.Event, 1),
-	}
-	wa.echan <- &store.Event{
-		Action: store.Get,
-		Node:   &store.NodeExtern{},
-	}
-
-	handleWatch(context.Background(), rw, wa, false, dummyRaftTimer{})
-
-	wcode := http.StatusOK
-	wct := "application/json"
-	wri := "100"
-	wrt := "5"
-	wbody := mustMarshalEvent(
-		t,
-		&store.Event{
-			Action: store.Get,
-			Node:   &store.NodeExtern{},
-		},
-	)
-
-	if rw.Code != wcode {
-		t.Errorf("got code=%d, want %d", rw.Code, wcode)
-	}
-	h := rw.Header()
-	if ct := h.Get("Content-Type"); ct != wct {
-		t.Errorf("Content-Type=%q, want %q", ct, wct)
-	}
-	if ri := h.Get("X-Raft-Index"); ri != wri {
-		t.Errorf("X-Raft-Index=%q, want %q", ri, wri)
-	}
-	if rt := h.Get("X-Raft-Term"); rt != wrt {
-		t.Errorf("X-Raft-Term=%q, want %q", rt, wrt)
-	}
-	g := rw.Body.String()
-	if g != wbody {
-		t.Errorf("got body=%#v, want %#v", g, wbody)
-	}
-}
-
-func TestHandleWatchNoEvent(t *testing.T) {
-	rw := httptest.NewRecorder()
-	wa := &dummyWatcher{
-		echan: make(chan *store.Event, 1),
-	}
-	close(wa.echan)
-
-	handleWatch(context.Background(), rw, wa, false, dummyRaftTimer{})
-
-	wcode := http.StatusOK
-	wct := "application/json"
-	wbody := ""
-
-	if rw.Code != wcode {
-		t.Errorf("got code=%d, want %d", rw.Code, wcode)
-	}
-	h := rw.Header()
-	if ct := h.Get("Content-Type"); ct != wct {
-		t.Errorf("Content-Type=%q, want %q", ct, wct)
-	}
-	g := rw.Body.String()
-	if g != wbody {
-		t.Errorf("got body=%#v, want %#v", g, wbody)
-	}
-}
-
 type recordingCloseNotifier struct {
 	*httptest.ResponseRecorder
 	cn chan bool
@@ -1075,56 +1008,114 @@ func (rcn *recordingCloseNotifier) CloseNotify() <-chan bool {
 	return rcn.cn
 }
 
-func TestHandleWatchCloseNotified(t *testing.T) {
-	rw := &recordingCloseNotifier{
-		ResponseRecorder: httptest.NewRecorder(),
-		cn:               make(chan bool, 1),
+func TestHandleWatch(t *testing.T) {
+	defaultRwRr := func() (http.ResponseWriter, *httptest.ResponseRecorder) {
+		r := httptest.NewRecorder()
+		return r, r
 	}
-	rw.cn <- true
-	wa := &dummyWatcher{}
+	noopEv := func(chan *store.Event) {}
 
-	handleWatch(context.Background(), rw, wa, false, dummyRaftTimer{})
+	tests := []struct {
+		getCtx   func() context.Context
+		getRwRr  func() (http.ResponseWriter, *httptest.ResponseRecorder)
+		doToChan func(chan *store.Event)
 
-	wcode := http.StatusOK
-	wct := "application/json"
-	wbody := ""
+		wbody string
+	}{
+		{
+			// Normal case: one event
+			context.Background,
+			defaultRwRr,
+			func(ch chan *store.Event) {
+				ch <- &store.Event{
+					Action: store.Get,
+					Node:   &store.NodeExtern{},
+				}
+			},
 
-	if rw.Code != wcode {
-		t.Errorf("got code=%d, want %d", rw.Code, wcode)
+			mustMarshalEvent(
+				t,
+				&store.Event{
+					Action: store.Get,
+					Node:   &store.NodeExtern{},
+				},
+			),
+		},
+		{
+			// Channel is closed, no event
+			context.Background,
+			defaultRwRr,
+			func(ch chan *store.Event) {
+				close(ch)
+			},
+
+			"",
+		},
+		{
+			// Simulate a timed-out context
+			func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+			defaultRwRr,
+			noopEv,
+
+			"",
+		},
+		{
+			// Close-notifying request
+			context.Background,
+			func() (http.ResponseWriter, *httptest.ResponseRecorder) {
+				rw := &recordingCloseNotifier{
+					ResponseRecorder: httptest.NewRecorder(),
+					cn:               make(chan bool, 1),
+				}
+				rw.cn <- true
+				return rw, rw.ResponseRecorder
+			},
+			noopEv,
+
+			"",
+		},
 	}
-	h := rw.Header()
-	if ct := h.Get("Content-Type"); ct != wct {
-		t.Errorf("Content-Type=%q, want %q", ct, wct)
-	}
-	g := rw.Body.String()
-	if g != wbody {
-		t.Errorf("got body=%#v, want %#v", g, wbody)
-	}
-}
 
-func TestHandleWatchTimeout(t *testing.T) {
-	rw := httptest.NewRecorder()
-	wa := &dummyWatcher{}
-	// Simulate a timed-out context
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	for i, tt := range tests {
+		rw, rr := tt.getRwRr()
+		wa := &dummyWatcher{
+			echan: make(chan *store.Event, 1),
+			sidx:  10,
+		}
+		tt.doToChan(wa.echan)
 
-	handleWatch(ctx, rw, wa, false, dummyRaftTimer{})
+		handleWatch(tt.getCtx(), rw, wa, false, dummyRaftTimer{})
 
-	wcode := http.StatusOK
-	wct := "application/json"
-	wbody := ""
+		wcode := http.StatusOK
+		wct := "application/json"
+		wei := "10"
+		wri := "100"
+		wrt := "5"
 
-	if rw.Code != wcode {
-		t.Errorf("got code=%d, want %d", rw.Code, wcode)
-	}
-	h := rw.Header()
-	if ct := h.Get("Content-Type"); ct != wct {
-		t.Errorf("Content-Type=%q, want %q", ct, wct)
-	}
-	g := rw.Body.String()
-	if g != wbody {
-		t.Errorf("got body=%#v, want %#v", g, wbody)
+		if rr.Code != wcode {
+			t.Errorf("#%d: got code=%d, want %d", rr.Code, wcode)
+		}
+		h := rr.Header()
+		if ct := h.Get("Content-Type"); ct != wct {
+			t.Errorf("#%d: Content-Type=%q, want %q", i, ct, wct)
+		}
+		if ei := h.Get("X-Etcd-Index"); ei != wei {
+			t.Errorf("#%d: X-Etcd-Index=%q, want %q", i, ei, wei)
+		}
+		if ri := h.Get("X-Raft-Index"); ri != wri {
+			t.Errorf("#%d: X-Raft-Index=%q, want %q", i, ri, wri)
+		}
+		if rt := h.Get("X-Raft-Term"); rt != wrt {
+			t.Errorf("#%d: X-Raft-Term=%q, want %q", i, rt, wrt)
+		}
+		g := rr.Body.String()
+		if g != tt.wbody {
+			t.Errorf("#%d: got body=%#v, want %#v", i, g, tt.wbody)
+		}
 	}
 }
 
@@ -1247,10 +1238,12 @@ type fakeCluster struct {
 	members []etcdserver.Member
 }
 
+func (c *fakeCluster) Add(m etcdserver.Member) { return }
+
 func (c *fakeCluster) Get() etcdserver.Cluster {
 	cl := &etcdserver.Cluster{}
 	cl.AddSlice(c.members)
 	return *cl
 }
 
-func (c *fakeCluster) Delete(id int64) { return }
+func (c *fakeCluster) Remove(id uint64) { return }

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
-	"net/url"
 	"reflect"
 	"sync"
 	"testing"
@@ -76,7 +75,7 @@ func TestDoLocalAction(t *testing.T) {
 	}
 	for i, tt := range tests {
 		st := &storeRecorder{}
-		srv := &EtcdServer{Store: st}
+		srv := &EtcdServer{store: st}
 		resp, err := srv.Do(context.TODO(), tt.req)
 
 		if err != tt.werr {
@@ -112,7 +111,7 @@ func TestDoBadLocalAction(t *testing.T) {
 	}
 	for i, tt := range tests {
 		st := &errStoreRecorder{err: storeErr}
-		srv := &EtcdServer{Store: st}
+		srv := &EtcdServer{store: st}
 		resp, err := srv.Do(context.Background(), tt.req)
 
 		if err != storeErr {
@@ -128,7 +127,7 @@ func TestDoBadLocalAction(t *testing.T) {
 	}
 }
 
-func TestApply(t *testing.T) {
+func TestApplyRequest(t *testing.T) {
 	tests := []struct {
 		req pb.Request
 
@@ -355,8 +354,8 @@ func TestApply(t *testing.T) {
 
 	for i, tt := range tests {
 		st := &storeRecorder{}
-		srv := &EtcdServer{Store: st}
-		resp := srv.apply(tt.req)
+		srv := &EtcdServer{store: st}
+		resp := srv.applyRequest(tt.req)
 
 		if !reflect.DeepEqual(resp, tt.wresp) {
 			t.Errorf("#%d: resp = %+v, want %+v", i, resp, tt.wresp)
@@ -371,7 +370,7 @@ func TestApply(t *testing.T) {
 func TestClusterOf1(t *testing.T) { testServer(t, 1) }
 func TestClusterOf3(t *testing.T) { testServer(t, 3) }
 
-func testServer(t *testing.T, ns int64) {
+func testServer(t *testing.T, ns uint64) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -380,38 +379,37 @@ func testServer(t *testing.T, ns int64) {
 	send := func(msgs []raftpb.Message) {
 		for _, m := range msgs {
 			t.Logf("m = %+v\n", m)
-			ss[m.To-1].Node.Step(ctx, m)
+			ss[m.To-1].node.Step(ctx, m)
 		}
 	}
 
-	members := make([]int64, ns)
-	for i := int64(0); i < ns; i++ {
-		members[i] = i + 1
+	ids := make([]uint64, ns)
+	for i := uint64(0); i < ns; i++ {
+		ids[i] = i + 1
 	}
+	members := mustMakePeerSlice(t, ids...)
 
-	for i := int64(0); i < ns; i++ {
+	for i := uint64(0); i < ns; i++ {
 		id := i + 1
 		n := raft.StartNode(id, members, 10, 1)
 		tk := time.NewTicker(10 * time.Millisecond)
 		defer tk.Stop()
 		srv := &EtcdServer{
-			Node:    n,
-			Store:   store.New(),
-			Send:    send,
-			Storage: &storageRecorder{},
-			Ticker:  tk.C,
+			node:         n,
+			store:        store.New(),
+			send:         send,
+			storage:      &storageRecorder{},
+			ticker:       tk.C,
+			ClusterStore: &clusterStoreRecorder{},
 		}
 		srv.start()
-		// TODO(xiangli): randomize election timeout
-		// then remove this sleep.
-		time.Sleep(1 * time.Millisecond)
 		ss[i] = srv
 	}
 
 	for i := 1; i <= 10; i++ {
 		r := pb.Request{
 			Method: "PUT",
-			ID:     int64(i),
+			ID:     uint64(i),
 			Path:   "/foo",
 			Val:    "bar",
 		}
@@ -440,7 +438,7 @@ func testServer(t *testing.T, ns int64) {
 	var last interface{}
 	for i, sv := range ss {
 		sv.Stop()
-		g, _ := sv.Store.Get("/", true, true)
+		g, _ := sv.store.Get("/", true, true)
 		if last != nil && !reflect.DeepEqual(last, g) {
 			t.Errorf("server %d: Root = %#v, want %#v", i, g, last)
 		}
@@ -458,17 +456,18 @@ func TestDoProposal(t *testing.T) {
 
 	for i, tt := range tests {
 		ctx, _ := context.WithCancel(context.Background())
-		n := raft.StartNode(0xBAD0, []int64{0xBAD0}, 10, 1)
+		n := raft.StartNode(0xBAD0, mustMakePeerSlice(t, 0xBAD0), 10, 1)
 		st := &storeRecorder{}
 		tk := make(chan time.Time)
 		// this makes <-tk always successful, which accelerates internal clock
 		close(tk)
 		srv := &EtcdServer{
-			Node:    n,
-			Store:   st,
-			Send:    func(_ []raftpb.Message) {},
-			Storage: &storageRecorder{},
-			Ticker:  tk,
+			node:         n,
+			store:        st,
+			send:         func(_ []raftpb.Message) {},
+			storage:      &storageRecorder{},
+			ticker:       tk,
+			ClusterStore: &clusterStoreRecorder{},
 		}
 		srv.start()
 		resp, err := srv.Do(ctx, tt)
@@ -491,13 +490,13 @@ func TestDoProposal(t *testing.T) {
 func TestDoProposalCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	// node cannot make any progress because there are two nodes
-	n := raft.StartNode(0xBAD0, []int64{0xBAD0, 0xBAD1}, 10, 1)
+	n := raft.StartNode(0xBAD0, mustMakePeerSlice(t, 0xBAD0, 0xBAD1), 10, 1)
 	st := &storeRecorder{}
 	wait := &waitRecorder{}
 	srv := &EtcdServer{
 		// TODO: use fake node for better testability
-		Node:  n,
-		Store: st,
+		node:  n,
+		store: st,
 		w:     wait,
 	}
 
@@ -527,18 +526,18 @@ func TestDoProposalStopped(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	// node cannot make any progress because there are two nodes
-	n := raft.StartNode(0xBAD0, []int64{0xBAD0, 0xBAD1}, 10, 1)
+	n := raft.StartNode(0xBAD0, mustMakePeerSlice(t, 0xBAD0, 0xBAD1), 10, 1)
 	st := &storeRecorder{}
 	tk := make(chan time.Time)
 	// this makes <-tk always successful, which accelarates internal clock
 	close(tk)
 	srv := &EtcdServer{
 		// TODO: use fake node for better testability
-		Node:    n,
-		Store:   st,
-		Send:    func(_ []raftpb.Message) {},
-		Storage: &storageRecorder{},
-		Ticker:  tk,
+		node:    n,
+		store:   st,
+		send:    func(_ []raftpb.Message) {},
+		storage: &storageRecorder{},
+		ticker:  tk,
 	}
 	srv.start()
 
@@ -564,7 +563,7 @@ func TestDoProposalStopped(t *testing.T) {
 func TestSync(t *testing.T) {
 	n := &nodeProposeDataRecorder{}
 	srv := &EtcdServer{
-		Node: n,
+		node: n,
 	}
 	start := time.Now()
 	srv.sync(defaultSyncTimeout)
@@ -593,7 +592,7 @@ func TestSync(t *testing.T) {
 func TestSyncTimeout(t *testing.T) {
 	n := &nodeProposalBlockerRecorder{}
 	srv := &EtcdServer{
-		Node: n,
+		node: n,
 	}
 	start := time.Now()
 	srv.sync(0)
@@ -634,11 +633,11 @@ func TestSyncTrigger(t *testing.T) {
 	}
 	st := make(chan time.Time, 1)
 	srv := &EtcdServer{
-		Node:       n,
-		Store:      &storeRecorder{},
-		Send:       func(_ []raftpb.Message) {},
-		Storage:    &storageRecorder{},
-		SyncTicker: st,
+		node:       n,
+		store:      &storeRecorder{},
+		send:       func(_ []raftpb.Message) {},
+		storage:    &storageRecorder{},
+		syncTicker: st,
 	}
 	srv.start()
 	// trigger the server to become a leader and accept sync requests
@@ -668,17 +667,17 @@ func TestSyncTrigger(t *testing.T) {
 // snapshot should snapshot the store and cut the persistent
 // TODO: node.Compact is called... we need to make the node an interface
 func TestSnapshot(t *testing.T) {
-	n := raft.StartNode(0xBAD0, []int64{0xBAD0}, 10, 1)
+	n := raft.StartNode(0xBAD0, mustMakePeerSlice(t, 0xBAD0), 10, 1)
 	defer n.Stop()
 	st := &storeRecorder{}
 	p := &storageRecorder{}
 	s := &EtcdServer{
-		Store:   st,
-		Storage: p,
-		Node:    n,
+		store:   st,
+		storage: p,
+		node:    n,
 	}
 
-	s.snapshot()
+	s.snapshot(0, []uint64{1})
 	gaction := st.Action()
 	if len(gaction) != 1 {
 		t.Fatalf("len(action) = %d, want 1", len(gaction))
@@ -699,20 +698,23 @@ func TestSnapshot(t *testing.T) {
 // Applied > SnapCount should trigger a SaveSnap event
 func TestTriggerSnap(t *testing.T) {
 	ctx := context.Background()
-	n := raft.StartNode(0xBAD0, []int64{0xBAD0}, 10, 1)
+	n := raft.StartNode(0xBAD0, mustMakePeerSlice(t, 0xBAD0), 10, 1)
+	<-n.Ready()
+	n.ApplyConfChange(raftpb.ConfChange{Type: raftpb.ConfChangeAddNode, NodeID: 0xBAD0})
 	n.Campaign(ctx)
 	st := &storeRecorder{}
 	p := &storageRecorder{}
 	s := &EtcdServer{
-		Store:     st,
-		Send:      func(_ []raftpb.Message) {},
-		Storage:   p,
-		Node:      n,
-		SnapCount: 10,
+		store:        st,
+		send:         func(_ []raftpb.Message) {},
+		storage:      p,
+		node:         n,
+		snapCount:    10,
+		ClusterStore: &clusterStoreRecorder{},
 	}
 
 	s.start()
-	for i := 0; int64(i) < s.SnapCount; i++ {
+	for i := 0; uint64(i) < s.snapCount-1; i++ {
 		s.Do(ctx, pb.Request{Method: "PUT", ID: 1})
 	}
 	time.Sleep(time.Millisecond)
@@ -720,12 +722,12 @@ func TestTriggerSnap(t *testing.T) {
 
 	gaction := p.Action()
 	// each operation is recorded as a Save
-	// Nop + SnapCount * Puts + Cut + SaveSnap = Save + SnapCount * Save + Cut + SaveSnap
-	if len(gaction) != 3+int(s.SnapCount) {
-		t.Fatalf("len(action) = %d, want %d", len(gaction), 3+int(s.SnapCount))
+	// BootstrapConfig/Nop + (SnapCount - 1) * Puts + Cut + SaveSnap = Save + (SnapCount - 1) * Save + Cut + SaveSnap
+	if len(gaction) != 2+int(s.snapCount) {
+		t.Fatalf("len(action) = %d, want %d", len(gaction), 2+int(s.snapCount))
 	}
-	if !reflect.DeepEqual(gaction[12], action{name: "SaveSnap"}) {
-		t.Errorf("action = %s, want SaveSnap", gaction[12])
+	if !reflect.DeepEqual(gaction[11], action{name: "SaveSnap"}) {
+		t.Errorf("action = %s, want SaveSnap", gaction[11])
 	}
 }
 
@@ -736,10 +738,10 @@ func TestRecvSnapshot(t *testing.T) {
 	st := &storeRecorder{}
 	p := &storageRecorder{}
 	s := &EtcdServer{
-		Store:   st,
-		Send:    func(_ []raftpb.Message) {},
-		Storage: p,
-		Node:    n,
+		store:   st,
+		send:    func(_ []raftpb.Message) {},
+		storage: p,
+		node:    n,
 	}
 
 	s.start()
@@ -764,10 +766,10 @@ func TestRecvSlowSnapshot(t *testing.T) {
 	n := newReadyNode()
 	st := &storeRecorder{}
 	s := &EtcdServer{
-		Store:   st,
-		Send:    func(_ []raftpb.Message) {},
-		Storage: &storageRecorder{},
-		Node:    n,
+		store:   st,
+		send:    func(_ []raftpb.Message) {},
+		storage: &storageRecorder{},
+		node:    n,
 	}
 
 	s.start()
@@ -786,17 +788,20 @@ func TestRecvSlowSnapshot(t *testing.T) {
 	}
 }
 
-// TestAddNode tests AddNode can propose and perform node addition.
-func TestAddNode(t *testing.T) {
+// TestAddMember tests AddMember can propose and perform node addition.
+func TestAddMember(t *testing.T) {
 	n := newNodeConfChangeCommitterRecorder()
+	cs := &clusterStoreRecorder{}
 	s := &EtcdServer{
-		Node:    n,
-		Store:   &storeRecorder{},
-		Send:    func(_ []raftpb.Message) {},
-		Storage: &storageRecorder{},
+		node:         n,
+		store:        &storeRecorder{},
+		send:         func(_ []raftpb.Message) {},
+		storage:      &storageRecorder{},
+		ClusterStore: cs,
 	}
 	s.start()
-	s.AddNode(context.TODO(), 1, []byte("foo"))
+	m := Member{ID: 1, RaftAttributes: RaftAttributes{PeerURLs: []string{"foo"}}}
+	s.AddMember(context.TODO(), m)
 	gaction := n.Action()
 	s.Stop()
 
@@ -804,19 +809,26 @@ func TestAddNode(t *testing.T) {
 	if !reflect.DeepEqual(gaction, wactions) {
 		t.Errorf("action = %v, want %v", gaction, wactions)
 	}
+	wcsactions := []action{{name: "Add", params: []interface{}{m}}}
+	if g := cs.Action(); !reflect.DeepEqual(g, wcsactions) {
+		t.Errorf("csaction = %v, want %v", g, wcsactions)
+	}
 }
 
-// TestRemoveNode tests RemoveNode can propose and perform node removal.
-func TestRemoveNode(t *testing.T) {
+// TestRemoveMember tests RemoveMember can propose and perform node removal.
+func TestRemoveMember(t *testing.T) {
 	n := newNodeConfChangeCommitterRecorder()
+	cs := &clusterStoreRecorder{}
 	s := &EtcdServer{
-		Node:    n,
-		Store:   &storeRecorder{},
-		Send:    func(_ []raftpb.Message) {},
-		Storage: &storageRecorder{},
+		node:         n,
+		store:        &storeRecorder{},
+		send:         func(_ []raftpb.Message) {},
+		storage:      &storageRecorder{},
+		ClusterStore: cs,
 	}
 	s.start()
-	s.RemoveNode(context.TODO(), 1)
+	id := uint64(1)
+	s.RemoveMember(context.TODO(), id)
 	gaction := n.Action()
 	s.Stop()
 
@@ -824,23 +836,45 @@ func TestRemoveNode(t *testing.T) {
 	if !reflect.DeepEqual(gaction, wactions) {
 		t.Errorf("action = %v, want %v", gaction, wactions)
 	}
+	wcsactions := []action{{name: "Remove", params: []interface{}{id}}}
+	if g := cs.Action(); !reflect.DeepEqual(g, wcsactions) {
+		t.Errorf("csaction = %v, want %v", g, wcsactions)
+	}
+}
+
+// TestServerStopItself tests that if node sends out Ready with ShouldStop,
+// server will stop.
+func TestServerStopItself(t *testing.T) {
+	n := newReadyNode()
+	s := &EtcdServer{
+		node:    n,
+		store:   &storeRecorder{},
+		send:    func(_ []raftpb.Message) {},
+		storage: &storageRecorder{},
+	}
+	s.start()
+	n.readyc <- raft.Ready{SoftState: &raft.SoftState{ShouldStop: true}}
+
+	select {
+	case <-s.done:
+	case <-time.After(time.Millisecond):
+		t.Errorf("did not receive from closed done channel as expected")
+	}
 }
 
 // TODO: test wait trigger correctness in multi-server case
 
 func TestPublish(t *testing.T) {
 	n := &nodeProposeDataRecorder{}
-	cs := mustClusterStore(t, []Member{{ID: 1, Name: "node1"}})
 	ch := make(chan interface{}, 1)
 	// simulate that request has gone through consensus
 	ch <- Response{}
 	w := &waitWithResponse{ch: ch}
 	srv := &EtcdServer{
-		Name:         "node1",
-		ClientURLs:   []url.URL{{Scheme: "http", Host: "a"}, {Scheme: "http", Host: "b"}},
-		Node:         n,
-		ClusterStore: cs,
-		w:            w,
+		id:         1,
+		attributes: Attributes{Name: "node1", ClientURLs: []string{"http://a", "http://b"}},
+		node:       n,
+		w:          w,
 	}
 	srv.publish(time.Hour)
 
@@ -855,28 +889,25 @@ func TestPublish(t *testing.T) {
 	if r.Method != "PUT" {
 		t.Errorf("method = %s, want PUT", r.Method)
 	}
-	wm := Member{ID: 1, Name: "node1", ClientURLs: []string{"http://a", "http://b"}}
-	if r.Path != wm.storeKey() {
-		t.Errorf("path = %s, want %s", r.Path, wm.storeKey())
+	wm := Member{ID: 1, Attributes: Attributes{Name: "node1", ClientURLs: []string{"http://a", "http://b"}}}
+	if r.Path != wm.storeKey()+attributesSuffix {
+		t.Errorf("path = %s, want %s", r.Path, wm.storeKey()+attributesSuffix)
 	}
-	var gm Member
-	if err := json.Unmarshal([]byte(r.Val), &gm); err != nil {
+	var gattr Attributes
+	if err := json.Unmarshal([]byte(r.Val), &gattr); err != nil {
 		t.Fatalf("unmarshal val error: %v", err)
 	}
-	if !reflect.DeepEqual(gm, wm) {
-		t.Errorf("member = %v, want %v", gm, wm)
+	if !reflect.DeepEqual(gattr, wm.Attributes) {
+		t.Errorf("member = %v, want %v", gattr, wm.Attributes)
 	}
 }
 
 // TestPublishStopped tests that publish will be stopped if server is stopped.
 func TestPublishStopped(t *testing.T) {
-	cs := mustClusterStore(t, []Member{{ID: 1, Name: "node1"}})
 	srv := &EtcdServer{
-		Name:         "node1",
-		Node:         &nodeRecorder{},
-		ClusterStore: cs,
-		w:            &waitRecorder{},
-		done:         make(chan struct{}),
+		node: &nodeRecorder{},
+		w:    &waitRecorder{},
+		done: make(chan struct{}),
 	}
 	srv.Stop()
 	srv.publish(time.Hour)
@@ -885,21 +916,18 @@ func TestPublishStopped(t *testing.T) {
 // TestPublishRetry tests that publish will keep retry until success.
 func TestPublishRetry(t *testing.T) {
 	n := &nodeRecorder{}
-	cs := mustClusterStore(t, []Member{{ID: 1, Name: "node1"}})
 	srv := &EtcdServer{
-		Name:         "node1",
-		Node:         n,
-		ClusterStore: cs,
-		w:            &waitRecorder{},
-		done:         make(chan struct{}),
+		node: n,
+		w:    &waitRecorder{},
+		done: make(chan struct{}),
 	}
 	time.AfterFunc(500*time.Microsecond, srv.Stop)
 	srv.publish(10 * time.Nanosecond)
 
 	action := n.Action()
-	// multiple Propose + Stop
-	if len(action) < 3 {
-		t.Errorf("len(action) = %d, want >= 3", action)
+	// multiple Proposes
+	if len(action) < 2 {
+		t.Errorf("len(action) = %d, want >= 2", action)
 	}
 }
 
@@ -928,9 +956,9 @@ func TestGenID(t *testing.T) {
 	// Sanity check that the GenID function has been seeded appropriately
 	// (math/rand is seeded with 1 by default)
 	r := rand.NewSource(int64(1))
-	var n int64
+	var n uint64
 	for n == 0 {
-		n = r.Int63()
+		n = uint64(r.Int63())
 	}
 	if n == GenID() {
 		t.Fatalf("GenID's rand seeded with 1!")
@@ -1039,6 +1067,7 @@ func (s *storeRecorder) DeleteExpiredKeys(cutoff time.Time) {
 type stubWatcher struct{}
 
 func (w *stubWatcher) EventChan() chan *store.Event { return nil }
+func (w *stubWatcher) StartIndex() uint64           { return 0 }
 func (w *stubWatcher) Remove()                      {}
 
 // errStoreRecorder returns an store error on Get, Watch request
@@ -1060,11 +1089,11 @@ type waitRecorder struct {
 	action []action
 }
 
-func (w *waitRecorder) Register(id int64) <-chan interface{} {
+func (w *waitRecorder) Register(id uint64) <-chan interface{} {
 	w.action = append(w.action, action{name: fmt.Sprint("Register", id)})
 	return nil
 }
-func (w *waitRecorder) Trigger(id int64, x interface{}) {
+func (w *waitRecorder) Trigger(id uint64, x interface{}) {
 	w.action = append(w.action, action{name: fmt.Sprint("Trigger", id)})
 }
 
@@ -1108,7 +1137,7 @@ func (n *readyNode) Step(ctx context.Context, msg raftpb.Message) error { return
 func (n *readyNode) Ready() <-chan raft.Ready                           { return n.readyc }
 func (n *readyNode) ApplyConfChange(conf raftpb.ConfChange)             {}
 func (n *readyNode) Stop()                                              {}
-func (n *readyNode) Compact(d []byte)                                   {}
+func (n *readyNode) Compact(index uint64, nodes []uint64, d []byte)     {}
 
 type nodeRecorder struct {
 	recorder
@@ -1140,7 +1169,7 @@ func (n *nodeRecorder) ApplyConfChange(conf raftpb.ConfChange) {
 func (n *nodeRecorder) Stop() {
 	n.record(action{name: "Stop"})
 }
-func (n *nodeRecorder) Compact(d []byte) {
+func (n *nodeRecorder) Compact(index uint64, nodes []uint64, d []byte) {
 	n.record(action{name: "Compact"})
 }
 
@@ -1204,15 +1233,35 @@ type waitWithResponse struct {
 	ch <-chan interface{}
 }
 
-func (w *waitWithResponse) Register(id int64) <-chan interface{} {
+func (w *waitWithResponse) Register(id uint64) <-chan interface{} {
 	return w.ch
 }
-func (w *waitWithResponse) Trigger(id int64, x interface{}) {}
+func (w *waitWithResponse) Trigger(id uint64, x interface{}) {}
 
-func mustClusterStore(t *testing.T, membs []Member) ClusterStore {
-	c := Cluster{}
-	if err := c.AddSlice(membs); err != nil {
-		t.Fatalf("error creating cluster from %v: %v", membs, err)
+type clusterStoreRecorder struct {
+	recorder
+}
+
+func (cs *clusterStoreRecorder) Add(m Member) {
+	cs.record(action{name: "Add", params: []interface{}{m}})
+}
+func (cs *clusterStoreRecorder) Get() Cluster {
+	cs.record(action{name: "Get"})
+	return nil
+}
+func (cs *clusterStoreRecorder) Remove(id uint64) {
+	cs.record(action{name: "Remove", params: []interface{}{id}})
+}
+
+func mustMakePeerSlice(t *testing.T, ids ...uint64) []raft.Peer {
+	peers := make([]raft.Peer, len(ids))
+	for i, id := range ids {
+		m := Member{ID: id}
+		b, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		peers[i] = raft.Peer{ID: id, Context: b}
 	}
-	return NewClusterStore(&getAllStore{}, c)
+	return peers
 }

@@ -5,22 +5,29 @@ import (
 	"errors"
 	"log"
 	"math/rand"
+	"os"
+	"path"
 	"sync/atomic"
 	"time"
 
+	"github.com/coreos/etcd/discovery"
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
-	"github.com/coreos/etcd/pkg/types"
 	"github.com/coreos/etcd/raft"
 	"github.com/coreos/etcd/raft/raftpb"
+	"github.com/coreos/etcd/snap"
 	"github.com/coreos/etcd/store"
 	"github.com/coreos/etcd/third_party/code.google.com/p/go.net/context"
 	"github.com/coreos/etcd/wait"
+	"github.com/coreos/etcd/wal"
 )
 
 const (
+	// owner can make/remove files inside the directory
+	privateDirMode = 0700
+
 	defaultSyncTimeout = time.Second
 	DefaultSnapCount   = 10000
-	// TODO: calculated based on heartbeat interval
+	// TODO: calculate based on heartbeat interval
 	defaultPublishRetryInterval = 5 * time.Second
 )
 
@@ -33,8 +40,7 @@ func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
-type SendFunc func(m []raftpb.Message)
-type SaveFunc func(st raftpb.HardState, ents []raftpb.Entry)
+type sendFunc func(m []raftpb.Message)
 
 type Response struct {
 	Event   *store.Event
@@ -72,38 +78,143 @@ type Server interface {
 }
 
 type RaftTimer interface {
-	Index() int64
-	Term() int64
+	Index() uint64
+	Term() uint64
+}
+
+// NewServer creates a new EtcdServer from the supplied configuration. The
+// configuration is considered static for the lifetime of the EtcdServer.
+func NewServer(cfg *ServerConfig) *EtcdServer {
+	err := cfg.Verify()
+	if err != nil {
+		log.Fatalln(err)
+	}
+	snapdir := path.Join(cfg.DataDir, "snap")
+	if err := os.MkdirAll(snapdir, privateDirMode); err != nil {
+		log.Fatalf("etcdserver: cannot create snapshot directory: %v", err)
+	}
+	ss := snap.New(snapdir)
+	st := store.New()
+	var w *wal.WAL
+	var n raft.Node
+	m := cfg.Cluster.FindName(cfg.Name)
+	waldir := path.Join(cfg.DataDir, "wal")
+	if !wal.Exist(waldir) {
+		if cfg.DiscoveryURL != "" {
+			d, err := discovery.New(cfg.DiscoveryURL, m.ID, cfg.Cluster.String())
+			if err != nil {
+				log.Fatalf("etcd: cannot init discovery %v", err)
+			}
+			s, err := d.Discover()
+			if err != nil {
+				log.Fatalf("etcd: %v", err)
+			}
+			if err = cfg.Cluster.Set(s); err != nil {
+				log.Fatalf("etcd: %v", err)
+			}
+		} else if (cfg.ClusterState) != ClusterStateValueNew {
+			log.Fatalf("etcd: initial cluster state unset and no wal or discovery URL found")
+		}
+		i := pb.Info{ID: m.ID}
+		b, err := i.Marshal()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if w, err = wal.Create(waldir, b); err != nil {
+			log.Fatal(err)
+		}
+
+		ids := cfg.Cluster.IDs()
+		peers := make([]raft.Peer, len(ids))
+		for i, id := range ids {
+			ctx, err := json.Marshal((*cfg.Cluster)[id])
+			if err != nil {
+				log.Fatal(err)
+			}
+			peers[i] = raft.Peer{ID: id, Context: ctx}
+		}
+		n = raft.StartNode(m.ID, peers, 10, 1)
+	} else {
+		if cfg.DiscoveryURL != "" {
+			log.Printf("etcd: warn: ignoring discovery URL: etcd has already been initialized and has a valid log in %q", waldir)
+		}
+		var index uint64
+		snapshot, err := ss.Load()
+		if err != nil && err != snap.ErrNoSnapshot {
+			log.Fatal(err)
+		}
+		if snapshot != nil {
+			log.Printf("etcdserver: restart from snapshot at index %d", snapshot.Index)
+			st.Recovery(snapshot.Data)
+			index = snapshot.Index
+		}
+
+		// restart a node from previous wal
+		if w, err = wal.OpenAtIndex(waldir, index); err != nil {
+			log.Fatal(err)
+		}
+		md, st, ents, err := w.ReadAll()
+		if err != nil {
+			log.Fatal(err)
+		}
+		var info pb.Info
+		if err := info.Unmarshal(md); err != nil {
+			log.Fatal(err)
+		}
+		// TODO(xiangli): save/recovery nodeID?
+		if info.ID != m.ID {
+			log.Fatalf("unexpected nodeid %x, want %x: nodeid should always be the same until we support name/peerURLs update or dynamic configuration", info.ID, m.ID)
+		}
+		n = raft.RestartNode(m.ID, 10, 1, snapshot, st, ents)
+	}
+
+	cls := &clusterStore{Store: st}
+	s := &EtcdServer{
+		store:      st,
+		node:       n,
+		id:         m.ID,
+		attributes: Attributes{Name: cfg.Name, ClientURLs: cfg.ClientURLs.StringSlice()},
+		storage: struct {
+			*wal.WAL
+			*snap.Snapshotter
+		}{w, ss},
+		send:         Sender(cfg.Transport, cls),
+		ticker:       time.Tick(100 * time.Millisecond),
+		syncTicker:   time.Tick(500 * time.Millisecond),
+		snapCount:    cfg.SnapCount,
+		ClusterStore: cls,
+	}
+	return s
 }
 
 // EtcdServer is the production implementation of the Server interface
 type EtcdServer struct {
-	w    wait.Wait
-	done chan struct{}
+	w          wait.Wait
+	done       chan struct{}
+	id         uint64
+	attributes Attributes
 
-	Name       string
-	ClientURLs types.URLs
+	ClusterStore ClusterStore
 
-	Node  raft.Node
-	Store store.Store
+	node  raft.Node
+	store store.Store
 
-	// Send specifies the send function for sending msgs to members. Send
+	// send specifies the send function for sending msgs to members. send
 	// MUST NOT block. It is okay to drop messages, since clients should
-	// timeout and reissue their messages.  If Send is nil, server will
+	// timeout and reissue their messages.  If send is nil, server will
 	// panic.
-	Send SendFunc
+	send sendFunc
 
-	Storage Storage
+	storage Storage
 
-	Ticker     <-chan time.Time
-	SyncTicker <-chan time.Time
+	ticker     <-chan time.Time
+	syncTicker <-chan time.Time
 
-	SnapCount int64 // number of entries to trigger a snapshot
+	snapCount uint64 // number of entries to trigger a snapshot
 
 	// Cache of the latest raft index and raft term the server has seen
-	raftIndex    int64
-	raftTerm     int64
-	ClusterStore ClusterStore
+	raftIndex uint64
+	raftTerm  uint64
 }
 
 // Start prepares and starts server in a new goroutine. It is no longer safe to
@@ -118,9 +229,9 @@ func (s *EtcdServer) Start() {
 // modify a server's fields after it has been sent to Start.
 // This function is just used for testing.
 func (s *EtcdServer) start() {
-	if s.SnapCount == 0 {
+	if s.snapCount == 0 {
 		log.Printf("etcdserver: set snapshot count to default %d", DefaultSnapCount)
-		s.SnapCount = DefaultSnapCount
+		s.snapCount = DefaultSnapCount
 	}
 	s.w = wait.New()
 	s.done = make(chan struct{})
@@ -130,21 +241,22 @@ func (s *EtcdServer) start() {
 }
 
 func (s *EtcdServer) Process(ctx context.Context, m raftpb.Message) error {
-	return s.Node.Step(ctx, m)
+	return s.node.Step(ctx, m)
 }
 
 func (s *EtcdServer) run() {
 	var syncC <-chan time.Time
 	// snapi indicates the index of the last submitted snapshot request
-	var snapi, appliedi int64
+	var snapi, appliedi uint64
+	var nodes []uint64
 	for {
 		select {
-		case <-s.Ticker:
-			s.Node.Tick()
-		case rd := <-s.Node.Ready():
-			s.Storage.Save(rd.HardState, rd.Entries)
-			s.Storage.SaveSnap(rd.Snapshot)
-			s.Send(rd.Messages)
+		case <-s.ticker:
+			s.node.Tick()
+		case rd := <-s.node.Ready():
+			s.storage.Save(rd.HardState, rd.Entries)
+			s.storage.SaveSnap(rd.Snapshot)
+			s.send(rd.Messages)
 
 			// TODO(bmizerany): do this in the background, but take
 			// care to apply entries in a single goroutine, and not
@@ -157,20 +269,33 @@ func (s *EtcdServer) run() {
 					if err := r.Unmarshal(e.Data); err != nil {
 						panic("TODO: this is bad, what do we do about it?")
 					}
-					s.w.Trigger(r.ID, s.apply(r))
+					s.w.Trigger(r.ID, s.applyRequest(r))
 				case raftpb.EntryConfChange:
 					var cc raftpb.ConfChange
 					if err := cc.Unmarshal(e.Data); err != nil {
 						panic("TODO: this is bad, what do we do about it?")
 					}
-					s.Node.ApplyConfChange(cc)
+					s.applyConfChange(cc)
 					s.w.Trigger(cc.ID, nil)
 				default:
 					panic("unexpected entry type")
 				}
-				atomic.StoreInt64(&s.raftIndex, e.Index)
-				atomic.StoreInt64(&s.raftTerm, e.Term)
+				atomic.StoreUint64(&s.raftIndex, e.Index)
+				atomic.StoreUint64(&s.raftTerm, e.Term)
 				appliedi = e.Index
+			}
+
+			if rd.SoftState != nil {
+				nodes = rd.SoftState.Nodes
+				if rd.RaftState == raft.StateLeader {
+					syncC = s.syncTicker
+				} else {
+					syncC = nil
+				}
+				if rd.SoftState.ShouldStop {
+					s.Stop()
+					return
+				}
 			}
 
 			if rd.Snapshot.Index > snapi {
@@ -179,23 +304,15 @@ func (s *EtcdServer) run() {
 
 			// recover from snapshot if it is more updated than current applied
 			if rd.Snapshot.Index > appliedi {
-				if err := s.Store.Recovery(rd.Snapshot.Data); err != nil {
+				if err := s.store.Recovery(rd.Snapshot.Data); err != nil {
 					panic("TODO: this is bad, what do we do about it?")
 				}
 				appliedi = rd.Snapshot.Index
 			}
 
-			if appliedi-snapi > s.SnapCount {
-				s.snapshot()
+			if appliedi-snapi > s.snapCount {
+				s.snapshot(appliedi, nodes)
 				snapi = appliedi
-			}
-
-			if rd.SoftState != nil {
-				if rd.RaftState == raft.StateLeader {
-					syncC = s.SyncTicker
-				} else {
-					syncC = nil
-				}
 			}
 		case <-syncC:
 			s.sync(defaultSyncTimeout)
@@ -208,11 +325,11 @@ func (s *EtcdServer) run() {
 // Stop stops the server, and shuts down the running goroutine. Stop should be
 // called after a Start(s), otherwise it will block forever.
 func (s *EtcdServer) Stop() {
-	s.Node.Stop()
+	s.node.Stop()
 	close(s.done)
 }
 
-// Do interprets r and performs an operation on s.Store according to r.Method
+// Do interprets r and performs an operation on s.store according to r.Method
 // and other fields. If r.Method is "POST", "PUT", "DELETE", or a "GET" with
 // Quorum == true, r will be sent through consensus before performing its
 // respective operation. Do will block until an action is performed or there is
@@ -231,7 +348,7 @@ func (s *EtcdServer) Do(ctx context.Context, r pb.Request) (Response, error) {
 			return Response{}, err
 		}
 		ch := s.w.Register(r.ID)
-		s.Node.Propose(ctx, data)
+		s.node.Propose(ctx, data)
 		select {
 		case x := <-ch:
 			resp := x.(Response)
@@ -245,13 +362,13 @@ func (s *EtcdServer) Do(ctx context.Context, r pb.Request) (Response, error) {
 	case "GET":
 		switch {
 		case r.Wait:
-			wc, err := s.Store.Watch(r.Path, r.Recursive, r.Stream, r.Since)
+			wc, err := s.store.Watch(r.Path, r.Recursive, r.Stream, r.Since)
 			if err != nil {
 				return Response{}, err
 			}
 			return Response{Watcher: wc}, nil
 		default:
-			ev, err := s.Store.Get(r.Path, r.Recursive, r.Sorted)
+			ev, err := s.store.Get(r.Path, r.Recursive, r.Sorted)
 			if err != nil {
 				return Response{}, err
 			}
@@ -262,17 +379,22 @@ func (s *EtcdServer) Do(ctx context.Context, r pb.Request) (Response, error) {
 	}
 }
 
-func (s *EtcdServer) AddNode(ctx context.Context, id int64, context []byte) error {
+func (s *EtcdServer) AddMember(ctx context.Context, memb Member) error {
+	// TODO: move Member to protobuf type
+	b, err := json.Marshal(memb)
+	if err != nil {
+		return err
+	}
 	cc := raftpb.ConfChange{
 		ID:      GenID(),
 		Type:    raftpb.ConfChangeAddNode,
-		NodeID:  id,
-		Context: context,
+		NodeID:  memb.ID,
+		Context: b,
 	}
 	return s.configure(ctx, cc)
 }
 
-func (s *EtcdServer) RemoveNode(ctx context.Context, id int64) error {
+func (s *EtcdServer) RemoveMember(ctx context.Context, id uint64) error {
 	cc := raftpb.ConfChange{
 		ID:     GenID(),
 		Type:   raftpb.ConfChangeRemoveNode,
@@ -282,19 +404,19 @@ func (s *EtcdServer) RemoveNode(ctx context.Context, id int64) error {
 }
 
 // Implement the RaftTimer interface
-func (s *EtcdServer) Index() int64 {
-	return atomic.LoadInt64(&s.raftIndex)
+func (s *EtcdServer) Index() uint64 {
+	return atomic.LoadUint64(&s.raftIndex)
 }
 
-func (s *EtcdServer) Term() int64 {
-	return atomic.LoadInt64(&s.raftTerm)
+func (s *EtcdServer) Term() uint64 {
+	return atomic.LoadUint64(&s.raftTerm)
 }
 
 // configure sends configuration change through consensus then performs it.
 // It will block until the change is performed or there is an error.
 func (s *EtcdServer) configure(ctx context.Context, cc raftpb.ConfChange) error {
 	ch := s.w.Register(cc.ID)
-	if err := s.Node.ProposeConfChange(ctx, cc); err != nil {
+	if err := s.node.ProposeConfChange(ctx, cc); err != nil {
 		log.Printf("configure error: %v", err)
 		s.w.Trigger(cc.ID, nil)
 		return err
@@ -328,21 +450,18 @@ func (s *EtcdServer) sync(timeout time.Duration) {
 	// There is no promise that node has leader when do SYNC request,
 	// so it uses goroutine to propose.
 	go func() {
-		s.Node.Propose(ctx, data)
+		s.node.Propose(ctx, data)
 		cancel()
 	}()
 }
 
 // publish registers server information into the cluster. The information
-// is the json format of its self member struct, whose ClientURLs may be
-// updated.
+// is the JSON representation of this server's member struct, updated with the
+// static clientURLs of the server.
 // The function keeps attempting to register until it succeeds,
 // or its server is stopped.
-// TODO: take care of info fetched from cluster store after having reconfig.
 func (s *EtcdServer) publish(retryInterval time.Duration) {
-	m := *s.ClusterStore.Get().FindName(s.Name)
-	m.ClientURLs = s.ClientURLs.StringSlice()
-	b, err := json.Marshal(m)
+	b, err := json.Marshal(s.attributes)
 	if err != nil {
 		log.Printf("etcdserver: json marshal error: %v", err)
 		return
@@ -350,7 +469,7 @@ func (s *EtcdServer) publish(retryInterval time.Duration) {
 	req := pb.Request{
 		ID:     GenID(),
 		Method: "PUT",
-		Path:   m.storeKey(),
+		Path:   Member{ID: s.id}.storeKey() + attributesSuffix,
 		Val:    string(b),
 	}
 
@@ -360,7 +479,7 @@ func (s *EtcdServer) publish(retryInterval time.Duration) {
 		cancel()
 		switch err {
 		case nil:
-			log.Printf("etcdserver: published %+v to the cluster", m)
+			log.Printf("etcdserver: published %+v to the cluster", s.attributes)
 			return
 		case ErrStopped:
 			log.Printf("etcdserver: aborting publish because server is stopped")
@@ -379,40 +498,40 @@ func getExpirationTime(r *pb.Request) time.Time {
 	return t
 }
 
-// apply interprets r as a call to store.X and returns a Response interpreted
+// applyRequest interprets r as a call to store.X and returns a Response interpreted
 // from store.Event
-func (s *EtcdServer) apply(r pb.Request) Response {
+func (s *EtcdServer) applyRequest(r pb.Request) Response {
 	f := func(ev *store.Event, err error) Response {
 		return Response{Event: ev, err: err}
 	}
 	expr := getExpirationTime(&r)
 	switch r.Method {
 	case "POST":
-		return f(s.Store.Create(r.Path, r.Dir, r.Val, true, expr))
+		return f(s.store.Create(r.Path, r.Dir, r.Val, true, expr))
 	case "PUT":
 		exists, existsSet := getBool(r.PrevExist)
 		switch {
 		case existsSet:
 			if exists {
-				return f(s.Store.Update(r.Path, r.Val, expr))
+				return f(s.store.Update(r.Path, r.Val, expr))
 			}
-			return f(s.Store.Create(r.Path, r.Dir, r.Val, false, expr))
+			return f(s.store.Create(r.Path, r.Dir, r.Val, false, expr))
 		case r.PrevIndex > 0 || r.PrevValue != "":
-			return f(s.Store.CompareAndSwap(r.Path, r.PrevValue, r.PrevIndex, r.Val, expr))
+			return f(s.store.CompareAndSwap(r.Path, r.PrevValue, r.PrevIndex, r.Val, expr))
 		default:
-			return f(s.Store.Set(r.Path, r.Dir, r.Val, expr))
+			return f(s.store.Set(r.Path, r.Dir, r.Val, expr))
 		}
 	case "DELETE":
 		switch {
 		case r.PrevIndex > 0 || r.PrevValue != "":
-			return f(s.Store.CompareAndDelete(r.Path, r.PrevValue, r.PrevIndex))
+			return f(s.store.CompareAndDelete(r.Path, r.PrevValue, r.PrevIndex))
 		default:
-			return f(s.Store.Delete(r.Path, r.Dir, r.Recursive))
+			return f(s.store.Delete(r.Path, r.Dir, r.Recursive))
 		}
 	case "QGET":
-		return f(s.Store.Get(r.Path, r.Recursive, r.Sorted))
+		return f(s.store.Get(r.Path, r.Recursive, r.Sorted))
 	case "SYNC":
-		s.Store.DeleteExpiredKeys(time.Unix(0, r.Time))
+		s.store.DeleteExpiredKeys(time.Unix(0, r.Time))
 		return Response{}
 	default:
 		// This should never be reached, but just in case:
@@ -420,23 +539,42 @@ func (s *EtcdServer) apply(r pb.Request) Response {
 	}
 }
 
+func (s *EtcdServer) applyConfChange(cc raftpb.ConfChange) {
+	s.node.ApplyConfChange(cc)
+	switch cc.Type {
+	case raftpb.ConfChangeAddNode:
+		var m Member
+		if err := json.Unmarshal(cc.Context, &m); err != nil {
+			panic("unexpected unmarshal error")
+		}
+		if cc.NodeID != m.ID {
+			panic("unexpected nodeID mismatch")
+		}
+		s.ClusterStore.Add(m)
+	case raftpb.ConfChangeRemoveNode:
+		s.ClusterStore.Remove(cc.NodeID)
+	default:
+		panic("unexpected ConfChange type")
+	}
+}
+
 // TODO: non-blocking snapshot
-func (s *EtcdServer) snapshot() {
-	d, err := s.Store.Save()
+func (s *EtcdServer) snapshot(snapi uint64, snapnodes []uint64) {
+	d, err := s.store.Save()
 	// TODO: current store will never fail to do a snapshot
 	// what should we do if the store might fail?
 	if err != nil {
 		panic("TODO: this is bad, what do we do about it?")
 	}
-	s.Node.Compact(d)
-	s.Storage.Cut()
+	s.node.Compact(snapi, snapnodes, d)
+	s.storage.Cut()
 }
 
 // TODO: move the function to /id pkg maybe?
 // GenID generates a random id that is not equal to 0.
-func GenID() (n int64) {
+func GenID() (n uint64) {
 	for n == 0 {
-		n = rand.Int63()
+		n = uint64(rand.Int63())
 	}
 	return
 }
